@@ -1,0 +1,766 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  HyperMorphic SDRG Causal Metric Flow                                       ║
+║  A State-Dependent Representation Geometry Primitive                        ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                              ║
+║  CORE IDEA                                                                   ║
+║  ────────────────────────────────────────────────────────────────────────    ║
+║  Classical prediction usually uses one fixed geometry:                       ║
+║                                                                              ║
+║      d(x,y)^2 = ||x-y||^2                                                     ║
+║                                                                              ║
+║  SDRG Causal Metric Flow makes the representation metric state-dependent:    ║
+║                                                                              ║
+║      d_t(z_i,z_j)^2 = (z_i - z_j)^T G_t (z_i - z_j)                          ║
+║                                                                              ║
+║  where:                                                                       ║
+║                                                                              ║
+║      G_t = Σ_c q_c(H_t) G_c                                                   ║
+║                                                                              ║
+║  G_c are chart metrics, and q_c(H_t) is a causal routing distribution        ║
+║  determined by local history, curvature, speed, acceleration, phase, and      ║
+║  online prediction regret.                                                    ║
+║                                                                              ║
+║  This is a prototype mathematical primitive for SDRG:                         ║
+║                                                                              ║
+║      representation space is not fixed background;                            ║
+║      the metric is part of the causal state.                                  ║
+║                                                                              ║
+║  CLAIM DISCIPLINE                                                             ║
+║  ────────────────────────────────────────────────────────────────────────    ║
+║  This is a research prototype. It does not claim state-of-the-art ML.        ║
+║  It demonstrates a new formal object: causal state-dependent metric flow.    ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+import math
+import os
+import json
+import time
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+
+from collections import Counter
+from dataclasses import dataclass
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 1 — UTILITIES
+# ═══════════════════════════════════════════════════════════════════════
+
+def softmax(logits):
+    z = np.asarray(logits, dtype=float)
+    z = z - np.max(z)
+    e = np.exp(z)
+    return e / np.sum(e)
+
+
+def mse(a, b):
+    return float(np.mean((np.asarray(a) - np.asarray(b)) ** 2))
+
+
+def improvement_pct(baseline, model):
+    return 100.0 * (baseline - model) / max(1e-12, baseline)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 2 — REGIME-SWITCHING SDRG BENCHMARK DATA
+# ═══════════════════════════════════════════════════════════════════════
+
+def rotation(theta, scale=0.985):
+    c, s = np.cos(theta), np.sin(theta)
+    return scale * np.array([[c, -s], [s, c]])
+
+
+def make_sdrg_sequence(seed=0, T=1400, noise=0.025):
+    """
+    Generate a regime-switching dynamical system.
+
+    Hidden regimes overlap in position space, so fixed Euclidean geometry
+    often confuses states that look positionally similar but have different
+    causal futures.
+
+    The correct geometry depends on causal history:
+      - position
+      - velocity
+      - acceleration
+      - curvature
+      - phase
+      - local energy
+    """
+    rng = np.random.default_rng(seed)
+
+    regimes = []
+    t = 0
+    r = int(rng.integers(0, 4))
+
+    while t < T + 2:
+        duration = int(rng.integers(35, 95))
+        r = int((r + rng.choice([1, 2, 3])) % 4)
+        regimes += [r] * duration
+        t += duration
+
+    regimes = np.array(regimes[:T + 2])
+
+    A = [
+        rotation(+0.25),
+        rotation(-0.25),
+        np.array([[1.020, 0.080], [0.000, 0.940]]),
+        np.array([[0.940, 0.000], [-0.080, 1.020]]),
+    ]
+
+    x = np.zeros((T + 2, 2))
+    x[0] = rng.normal(size=2) * 0.50
+    x[1] = x[0] + rng.normal(size=2) * 0.10
+
+    for i in range(1, T + 1):
+        regime = regimes[i]
+        prev = x[i]
+        vel = x[i] - x[i - 1]
+
+        if regime == 0:
+            nxt = A[regime] @ prev + 0.22 * np.tanh(np.array([vel[1], -vel[0]]))
+        elif regime == 1:
+            nxt = A[regime] @ prev + 0.22 * np.tanh(np.array([-vel[1], vel[0]]))
+        elif regime == 2:
+            nxt = A[regime] @ prev + 0.12 * np.array([
+                np.sin(2 * prev[1]),
+                np.cos(prev[0]),
+            ])
+        else:
+            nxt = A[regime] @ prev + 0.12 * np.array([
+                np.cos(prev[1]),
+                -np.sin(2 * prev[0]),
+            ])
+
+        nxt += noise * rng.normal(size=2)
+
+        # Keep the system bounded.
+        norm = np.linalg.norm(nxt)
+        if norm > 3.5:
+            nxt = nxt / norm * 3.5
+
+        x[i + 1] = nxt
+
+    return x[:T + 1], regimes[:T + 1]
+
+
+def build_causal_features(x):
+    """
+    z_t is a causal representation computed from history through time t.
+
+    Features:
+      0,1   position
+      2,3   velocity
+      4,5   acceleration
+      6     speed
+      7     acceleration magnitude
+      8     curvature-like cross(v,a)
+      9     alignment dot(v,a)
+      10    sin phase
+      11    cos phase
+    """
+    T = len(x) - 1
+    F = np.zeros((T, 12), dtype=float)
+
+    for t in range(T):
+        pos = x[t]
+
+        v = x[t] - x[t - 1] if t >= 1 else np.zeros(2)
+        v_prev = x[t - 1] - x[t - 2] if t >= 2 else np.zeros(2)
+        a = v - v_prev
+
+        speed = np.linalg.norm(v)
+        acc = np.linalg.norm(a)
+
+        cross = v[0] * a[1] - v[1] * a[0]
+        dot = float(v @ a)
+
+        angle = np.arctan2(v[1], v[0]) if speed > 1e-9 else 0.0
+
+        F[t] = [
+            pos[0], pos[1],
+            v[0], v[1],
+            a[0], a[1],
+            speed,
+            acc,
+            cross,
+            dot,
+            np.sin(angle),
+            np.cos(angle),
+        ]
+
+    return F
+
+
+def standardize(F):
+    mu = F.mean(axis=0)
+    sigma = F.std(axis=0) + 1e-6
+    return (F - mu) / sigma, mu, sigma
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 3 — METRIC KNN ENGINE
+# ═══════════════════════════════════════════════════════════════════════
+
+def knn_predict_metric(F, Y, t, diag_metric, k=12, warmup=80):
+    """
+    One-step prediction using a diagonal Mahalanobis metric.
+
+    d_t(i)^2 = (F_i - F_t)^T G (F_i - F_t)
+    """
+    if t <= warmup:
+        if t == 0:
+            return np.zeros(Y.shape[1])
+        return Y[:t].mean(axis=0)
+
+    Xpast = F[:t]
+    diff = Xpast - F[t]
+    d2 = np.sum((diff * diff) * diag_metric, axis=1)
+
+    k_eff = min(k, len(d2))
+    idx = np.argpartition(d2, k_eff - 1)[:k_eff]
+
+    dd = d2[idx]
+    w = 1.0 / (1e-6 + dd)
+
+    return np.sum(Y[idx] * w[:, None], axis=0) / np.sum(w)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 4 — SDRG CAUSAL METRIC FLOW
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class MetricChart:
+    name: str
+    diag: np.ndarray
+
+
+class SDRGCausalMetricFlow:
+    """
+    State-Dependent Representation Geometry primitive.
+
+    A finite metric atlas {G_c} is routed by a causal state H_t.
+
+    Router:
+        q_t = softmax(-η R_t + π(z_t))
+
+    where:
+        R_t = online EMA regret/loss of each chart
+        π(z_t) = causal state prior from speed/acceleration/curvature/phase
+
+    Metric:
+        G_t = Σ_c q_c(t) G_c
+
+    Predictor:
+        chart-wise metric KNN predictions are mixed by q_t.
+    """
+
+    def __init__(
+        self,
+        feature_dim=12,
+        k=12,
+        eta=4.0,
+        alpha=0.04,
+    ):
+        self.feature_dim = feature_dim
+        self.k = k
+        self.eta = eta
+        self.alpha = alpha
+
+        self.charts = self._build_charts(feature_dim)
+        self.loss = np.ones(len(self.charts), dtype=float)
+        self.last_weights = np.ones(len(self.charts)) / len(self.charts)
+
+    def _build_charts(self, D):
+        base = np.ones(D) * 0.15
+        charts = []
+
+        def make(name, weights):
+            v = base.copy()
+            for idx, value in weights.items():
+                v[idx] = value
+            charts.append(MetricChart(name, v))
+
+        make("position", {
+            0: 3.0, 1: 3.0,
+            2: 0.2, 3: 0.2,
+        })
+
+        make("velocity", {
+            0: 0.6, 1: 0.6,
+            2: 4.0, 3: 4.0,
+            6: 2.0,
+            10: 1.0, 11: 1.0,
+        })
+
+        make("acceleration", {
+            2: 0.8, 3: 0.8,
+            4: 4.0, 5: 4.0,
+            7: 3.0,
+            8: 2.0, 9: 2.0,
+        })
+
+        make("curvature", {
+            2: 1.0, 3: 1.0,
+            8: 5.0,
+            9: 3.0,
+            10: 2.0, 11: 2.0,
+        })
+
+        make("phase_energy", {
+            0: 0.8, 1: 0.8,
+            6: 3.0,
+            7: 2.0,
+            10: 4.0, 11: 4.0,
+        })
+
+        make("balanced", {i: 1.0 for i in range(D)})
+
+        return charts
+
+    def causal_prior_logits(self, z):
+        """
+        Deterministic causal prior over charts from current state.
+
+        The prior is not using the hidden regime. It only sees causal features.
+        """
+        speed = abs(z[6])
+        accel = abs(z[7])
+        curvature = abs(z[8]) + 0.5 * abs(z[9])
+        phase = abs(z[10]) + abs(z[11])
+
+        return np.array([
+            0.40 - 0.10 * speed - 0.10 * accel,
+            0.50 * speed,
+            0.55 * accel,
+            0.45 * curvature,
+            0.25 * phase + 0.15 * speed,
+            0.10,
+        ])
+
+    def weights(self, z):
+        logits = -self.eta * self.loss + self.causal_prior_logits(z)
+        q = softmax(logits)
+        self.last_weights = q
+        return q
+
+    def current_metric(self, z):
+        q = self.weights(z)
+        G = np.zeros(self.feature_dim)
+
+        for weight, chart in zip(q, self.charts):
+            G += weight * chart.diag
+
+        return G, q
+
+    def predict(self, F, Y, t):
+        q = self.weights(F[t])
+        chart_preds = []
+
+        for chart in self.charts:
+            pred = knn_predict_metric(F, Y, t, chart.diag, k=self.k)
+            chart_preds.append(pred)
+
+        chart_preds = np.array(chart_preds)
+        pred = np.sum(chart_preds * q[:, None], axis=0)
+
+        return pred, chart_preds, q
+
+    def update_from_previous(self, F, Y, t):
+        """
+        Online causal regret update.
+
+        At time t, Y[t-1] is known, so update chart losses based on
+        how each chart predicted the previous transition.
+        """
+        if t < 3:
+            return
+
+        prev = t - 1
+        errors = []
+
+        for chart in self.charts:
+            pred = knn_predict_metric(F, Y, prev, chart.diag, k=self.k)
+            errors.append(mse(pred, Y[prev]))
+
+        errors = np.array(errors)
+        self.loss = (1.0 - self.alpha) * self.loss + self.alpha * errors
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 5 — BENCHMARK
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_single_seed(seed=0, T=1400, warmup=80, k=12):
+    x, regimes = make_sdrg_sequence(seed=seed, T=T)
+    F = build_causal_features(x)
+    Y = x[1:]
+
+    Fz, mu, sigma = standardize(F)
+    D = Fz.shape[1]
+
+    baselines = {
+        "position_euclidean": np.array([1, 1] + [0] * (D - 2), dtype=float),
+
+        "fixed_augmented": np.ones(D, dtype=float),
+
+        "fixed_velocity": np.array([
+            0.5, 0.5,
+            4.0, 4.0,
+            0.2, 0.2,
+            2.0,
+            0.2,
+            0.2,
+            0.2,
+            1.0, 1.0,
+        ], dtype=float),
+
+        "fixed_curvature": np.array([
+            0.4, 0.4,
+            1.0, 1.0,
+            2.0, 2.0,
+            0.5,
+            1.0,
+            4.0,
+            3.0,
+            2.0, 2.0,
+        ], dtype=float),
+    }
+
+    errors = {name: [] for name in baselines}
+
+    sdrg = SDRGCausalMetricFlow(feature_dim=D, k=k)
+
+    sdrg_errors = []
+    weight_trace = []
+    active_chart_trace = []
+    metric_volume_trace = []
+
+    for t in range(warmup, len(Y) - 1):
+        # Update the geometry from previous causal prediction regret.
+        sdrg.update_from_previous(Fz, Y, t)
+
+        # Fixed-geometry baselines.
+        for name, diag in baselines.items():
+            pred = knn_predict_metric(Fz, Y, t, diag, k=k, warmup=warmup)
+            errors[name].append(mse(pred, Y[t]))
+
+        # SDRG state-dependent metric flow.
+        pred, chart_preds, q = sdrg.predict(Fz, Y, t)
+        sdrg_errors.append(mse(pred, Y[t]))
+
+        G, _ = sdrg.current_metric(Fz[t])
+        metric_volume = float(np.exp(np.mean(np.log(G + 1e-9))))
+
+        weight_trace.append(q)
+        active_chart_trace.append(int(np.argmax(q)))
+        metric_volume_trace.append(metric_volume)
+
+    summary = {name: float(np.mean(vals)) for name, vals in errors.items()}
+    summary["SDRG_causal_metric_flow"] = float(np.mean(sdrg_errors))
+
+    best_fixed = min(
+        summary[name]
+        for name in summary
+        if name != "SDRG_causal_metric_flow"
+    )
+
+    summary["best_fixed"] = float(best_fixed)
+    summary["SDRG_improvement_vs_best_fixed_pct"] = improvement_pct(
+        best_fixed,
+        summary["SDRG_causal_metric_flow"],
+    )
+
+    return {
+        "seed": seed,
+        "summary": summary,
+        "weight_trace": np.array(weight_trace),
+        "active_chart_trace": np.array(active_chart_trace),
+        "metric_volume_trace": np.array(metric_volume_trace),
+        "chart_names": [c.name for c in sdrg.charts],
+        "trajectory": x,
+        "regimes": regimes,
+    }
+
+
+def run_benchmark(seeds=(0, 1, 2, 3, 4), T=1400, warmup=80):
+    print("╔══════════════════════════════════════════════════════════════════════╗")
+    print("║  SDRG Causal Metric Flow Benchmark                                  ║")
+    print("╚══════════════════════════════════════════════════════════════════════╝")
+
+    runs = []
+
+    for seed in seeds:
+        result = run_single_seed(seed=seed, T=T, warmup=warmup)
+        runs.append(result)
+
+        s = result["summary"]
+        print()
+        print(f"Seed {seed}")
+        print("─" * 72)
+        for key, value in s.items():
+            if key.endswith("_pct"):
+                print(f"  {key:<38} {value:>10.2f}%")
+            else:
+                print(f"  {key:<38} {value:>10.6f}")
+
+    model_names = [
+        "position_euclidean",
+        "fixed_augmented",
+        "fixed_velocity",
+        "fixed_curvature",
+        "SDRG_causal_metric_flow",
+    ]
+
+    aggregate = {}
+
+    for name in model_names:
+        vals = [r["summary"][name] for r in runs]
+        aggregate[name] = {
+            "mean": float(np.mean(vals)),
+            "std": float(np.std(vals)),
+        }
+
+    improvements = [
+        r["summary"]["SDRG_improvement_vs_best_fixed_pct"]
+        for r in runs
+    ]
+
+    aggregate["SDRG_improvement_vs_best_fixed_pct"] = {
+        "mean": float(np.mean(improvements)),
+        "std": float(np.std(improvements)),
+    }
+
+    print()
+    print("════════════════════════════════════════════════════════════════════════")
+    print("AGGREGATE RESULTS")
+    print("════════════════════════════════════════════════════════════════════════")
+
+    for name in model_names:
+        print(
+            f"  {name:<32} "
+            f"MSE={aggregate[name]['mean']:.6f} ± {aggregate[name]['std']:.6f}"
+        )
+
+    print(
+        f"\n  SDRG improvement vs best fixed: "
+        f"{aggregate['SDRG_improvement_vs_best_fixed_pct']['mean']:.2f}% "
+        f"± {aggregate['SDRG_improvement_vs_best_fixed_pct']['std']:.2f}%"
+    )
+
+    return runs, aggregate
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 6 — TESTS
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_tests():
+    print("\n╔══════════════════════════════════════════════════════════════════════╗")
+    print("║  SDRG Causal Metric Flow — Tests                                    ║")
+    print("╚══════════════════════════════════════════════════════════════════════╝")
+
+    results = []
+
+    def check(name, ok, note=""):
+        results.append(bool(ok))
+        icon = "✅" if ok else "❌"
+        print(f"  {icon} {name:<65} {note}")
+
+    x, regimes = make_sdrg_sequence(seed=123, T=300)
+    F = build_causal_features(x)
+    Fz, _, _ = standardize(F)
+    Y = x[1:]
+
+    sdrg = SDRGCausalMetricFlow(feature_dim=Fz.shape[1])
+
+    G, q = sdrg.current_metric(Fz[100])
+
+    check("Feature matrix has expected shape", F.shape[1] == 12, str(F.shape))
+    check("Metric weights sum to one", abs(np.sum(q) - 1.0) < 1e-9, f"sum={np.sum(q)}")
+    check("Metric entries are positive", np.all(G > 0), f"min={G.min():.4f}")
+    check("Chart count is six", len(sdrg.charts) == 6, f"charts={len(sdrg.charts)}")
+
+    pred, chart_preds, q = sdrg.predict(Fz, Y, 100)
+
+    check("Prediction is 2D", pred.shape == (2,), str(pred.shape))
+    check("Chart predictions shape is valid", chart_preds.shape == (6, 2), str(chart_preds.shape))
+
+    old_loss = sdrg.loss.copy()
+    sdrg.update_from_previous(Fz, Y, 101)
+
+    check("Online regret update changes chart loss", np.linalg.norm(sdrg.loss - old_loss) > 0)
+
+    # Mini benchmark sanity.
+    r = run_single_seed(seed=999, T=500, warmup=60)
+    s = r["summary"]
+
+    check("Benchmark returns SDRG result", "SDRG_causal_metric_flow" in s)
+    check("Improvement value is finite", np.isfinite(s["SDRG_improvement_vs_best_fixed_pct"]))
+
+    passed = sum(results)
+    total = len(results)
+
+    print("\n" + "═" * 72)
+    print(f"  TESTS: {passed}/{total} passed")
+    print("═" * 72)
+
+    if passed == total:
+        print("  ✅ ALL TESTS PASSED")
+    else:
+        print(f"  ❌ {total - passed} TESTS FAILED")
+
+    return passed == total
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 7 — PLOTS
+# ═══════════════════════════════════════════════════════════════════════
+
+def plot_results(runs, aggregate, out_dir="sdrg_metric_flow_outputs"):
+    os.makedirs(out_dir, exist_ok=True)
+
+    model_names = [
+        "position_euclidean",
+        "fixed_augmented",
+        "fixed_velocity",
+        "fixed_curvature",
+        "SDRG_causal_metric_flow",
+    ]
+
+    means = [aggregate[m]["mean"] for m in model_names]
+    stds = [aggregate[m]["std"] for m in model_names]
+
+    plt.figure(figsize=(11, 5))
+    plt.bar(range(len(model_names)), means, yerr=stds, capsize=5)
+    plt.xticks(range(len(model_names)), model_names, rotation=25, ha="right")
+    plt.ylabel("Mean one-step prediction MSE")
+    plt.title("SDRG Causal Metric Flow vs Fixed Geometries")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "mse_bar.png"), dpi=180)
+    plt.show()
+
+    first = runs[0]
+    W = first["weight_trace"]
+    chart_names = first["chart_names"]
+
+    plt.figure(figsize=(12, 5))
+    for i, name in enumerate(chart_names):
+        plt.plot(W[:, i], label=name, linewidth=1.3)
+    plt.xlabel("Online time index after warmup")
+    plt.ylabel("Chart routing weight")
+    plt.title("SDRG Metric Atlas Routing Weights")
+    plt.legend(ncol=3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "router_weights.png"), dpi=180)
+    plt.show()
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(first["metric_volume_trace"], linewidth=1.5)
+    plt.xlabel("Online time index after warmup")
+    plt.ylabel("Geometric mean of metric diagonal")
+    plt.title("State-Dependent Metric Volume Proxy")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "metric_volume.png"), dpi=180)
+    plt.show()
+
+    x = first["trajectory"]
+    regimes = first["regimes"]
+
+    plt.figure(figsize=(6, 6))
+    plt.scatter(x[:-1, 0], x[:-1, 1], c=regimes[:-1], s=8)
+    plt.xlabel("x₁")
+    plt.ylabel("x₂")
+    plt.title("Regime-Switching Trajectory")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "trajectory.png"), dpi=180)
+    plt.show()
+
+    payload = {
+        "aggregate": aggregate,
+        "per_seed": [
+            {
+                "seed": r["seed"],
+                "summary": r["summary"],
+                "active_chart_counts": {
+                    r["chart_names"][k]: int(v)
+                    for k, v in Counter(r["active_chart_trace"]).items()
+                },
+            }
+            for r in runs
+        ],
+    }
+
+    with open(os.path.join(out_dir, "sdrg_metric_flow_results.json"), "w") as f:
+        json.dump(payload, f, indent=2)
+
+    print(f"\nSaved plots and JSON results to: {out_dir}/")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 8 — FORMAL SUMMARY
+# ═══════════════════════════════════════════════════════════════════════
+
+def formal_summary():
+    print("\n╔══════════════════════════════════════════════════════════════════════╗")
+    print("║  FORMAL SDRG CONTRIBUTION                                           ║")
+    print("╚══════════════════════════════════════════════════════════════════════╝")
+
+    print("""
+Primitive: SDRG Causal Metric Flow
+
+Let z_t be a causal representation of state history through time t.
+Let {G_c}_{c=1}^C be a finite atlas of positive diagonal metric charts.
+
+Define online chart regret:
+
+    R_c(t+1) = (1-α) R_c(t) + α · loss_c(t)
+
+Define causal chart routing:
+
+    q_c(t) = softmax_c( -η R_c(t) + π_c(z_t) )
+
+Define state-dependent metric:
+
+    G_t = Σ_c q_c(t) G_c
+
+Then the local representation distance is:
+
+    d_t(z_i,z_j)^2 = (z_i - z_j)^T G_t (z_i - z_j)
+
+Interpretation:
+
+    The geometry of representation space is no longer a fixed background.
+    The metric is a causal state variable updated by history, curvature,
+    acceleration, phase, and online regret.
+
+Contribution type:
+
+    New candidate mathematical primitive / prototype formalism.
+    Not a proof of optimality.
+    Not a production ML method.
+    It is a runnable demonstration of state-dependent representation geometry.
+""")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# RUN EVERYTHING
+# ═══════════════════════════════════════════════════════════════════════
+
+all_tests_passed = run_tests()
+
+runs, aggregate = run_benchmark(
+    seeds=(0, 1, 2, 3, 4),
+    T=1400,
+    warmup=80,
+)
+
+formal_summary()
+plot_results(runs, aggregate)
+
+if not all_tests_passed:
+    raise SystemExit("Tests failed.")
