@@ -764,3 +764,132 @@ plot_results(runs, aggregate)
 
 if not all_tests_passed:
     raise SystemExit("Tests failed.")
+
+
+╔══════════════════════════════════════════════════════════════════════╗
+║  SDRG Causal Metric Flow — Tests                                    ║
+╚══════════════════════════════════════════════════════════════════════╝
+  ✅ Feature matrix has expected shape                                 (300, 12)
+  ✅ Metric weights sum to one                                         sum=0.9999999999999999
+  ✅ Metric entries are positive                                       min=0.6783
+  ✅ Chart count is six                                                charts=6
+  ✅ Prediction is 2D                                                  (2,)
+  ✅ Chart predictions shape is valid                                  (6, 2)
+  ✅ Online regret update changes chart loss                           
+  ✅ Benchmark returns SDRG result                                     
+  ✅ Improvement value is finite                                       
+
+════════════════════════════════════════════════════════════════════════
+  TESTS: 9/9 passed
+════════════════════════════════════════════════════════════════════════
+  ✅ ALL TESTS PASSED
+╔══════════════════════════════════════════════════════════════════════╗
+║  SDRG Causal Metric Flow Benchmark                                  ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+Seed 0
+────────────────────────────────────────────────────────────────────────
+  position_euclidean                       0.167795
+  fixed_augmented                          0.208870
+  fixed_velocity                           0.296665
+  fixed_curvature                          0.397158
+  SDRG_causal_metric_flow                  0.161917
+  best_fixed                               0.167795
+  SDRG_improvement_vs_best_fixed_pct           3.50%
+
+Seed 1
+────────────────────────────────────────────────────────────────────────
+  position_euclidean                       0.294134
+  fixed_augmented                          0.170007
+  fixed_velocity                           0.162427
+  fixed_curvature                          0.402554
+  SDRG_causal_metric_flow                  0.151393
+  best_fixed                               0.162427
+  SDRG_improvement_vs_best_fixed_pct           6.79%
+
+Seed 2
+────────────────────────────────────────────────────────────────────────
+  position_euclidean                       0.215304
+  fixed_augmented                          0.219840
+  fixed_velocity                           0.236911
+  fixed_curvature                          0.407831
+  SDRG_causal_metric_flow                  0.169795
+  best_fixed                               0.215304
+  SDRG_improvement_vs_best_fixed_pct          21.14%
+
+Seed 3
+────────────────────────────────────────────────────────────────────────
+  position_euclidean                       0.262243
+  fixed_augmented                          0.224744
+  fixed_velocity                           0.268734
+  fixed_curvature                          0.402764
+  SDRG_causal_metric_flow                  0.165782
+  best_fixed                               0.224744
+  SDRG_improvement_vs_best_fixed_pct          26.23%
+
+Seed 4
+────────────────────────────────────────────────────────────────────────
+  position_euclidean                       0.300106
+  fixed_augmented                          0.208863
+  fixed_velocity                           0.250287
+  fixed_curvature                          0.400430
+  SDRG_causal_metric_flow                  0.158477
+  best_fixed                               0.208863
+  SDRG_improvement_vs_best_fixed_pct          24.12%
+
+════════════════════════════════════════════════════════════════════════
+AGGREGATE RESULTS
+════════════════════════════════════════════════════════════════════════
+  position_euclidean               MSE=0.247917 ± 0.050096
+  fixed_augmented                  MSE=0.206465 ± 0.019255
+  fixed_velocity                   MSE=0.243005 ± 0.044999
+  fixed_curvature                  MSE=0.402147 ± 0.003484
+  SDRG_causal_metric_flow          MSE=0.161473 ± 0.006302
+
+  SDRG improvement vs best fixed: 16.36% ± 9.35%
+
+╔══════════════════════════════════════════════════════════════════════╗
+║  FORMAL SDRG CONTRIBUTION                                           ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+Primitive: SDRG Causal Metric Flow
+
+Let z_t be a causal representation of state history through time t.
+Let {G_c}_{c=1}^C be a finite atlas of positive diagonal metric charts.
+
+Define online chart regret:
+
+    R_c(t+1) = (1-α) R_c(t) + α · loss_c(t)
+
+Define causal chart routing:
+
+    q_c(t) = softmax_c( -η R_c(t) + π_c(z_t) )
+
+Define state-dependent metric:
+
+    G_t = Σ_c q_c(t) G_c
+
+Then the local representation distance is:
+
+    d_t(z_i,z_j)^2 = (z_i - z_j)^T G_t (z_i - z_j)
+
+Interpretation:
+
+    The geometry of representation space is no longer a fixed background.
+    The metric is a causal state variable updated by history, curvature,
+    acceleration, phase, and online regret.
+
+Contribution type:
+
+    New candidate mathematical primitive / prototype formalism.
+    Not a proof of optimality.
+    Not a production ML method.
+    It is a runnable demonstration of state-dependent representation geometry.
+
+
+
+
+
+
+Saved plots and JSON results to: sdrg_metric_flow_outputs/
+
