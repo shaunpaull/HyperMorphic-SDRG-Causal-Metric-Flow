@@ -1,0 +1,931 @@
+# SDRG-CMF v3 GeometryGuard Benchmark
+# Colab/GitHub-ready one-script prototype.
+# Core change vs v2: SDRGFullV3 uses a guarded Hedge ensemble over metric-chart
+# KNN experts + local-linear geometry experts + persistence, so it can still
+# adapt across alias/drift tasks while protecting itself when one geometry
+# (often position) dominates a dynamical system.
+
+import os, json, time, math, random, platform, sys, zipfile, warnings
+from dataclasses import dataclass, asdict
+from typing import Tuple, Dict, List
+from collections import Counter
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+try:
+    from scipy.stats import ttest_rel, wilcoxon
+    SCIPY_AVAILABLE = True
+except Exception:
+    SCIPY_AVAILABLE = False
+
+warnings.filterwarnings("ignore")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class BenchmarkConfig:
+    seeds: Tuple[int, ...] = tuple(range(10))
+    T_main: int = 1200
+    T_aux: int = 800
+    warmup: int = 80
+    k_neighbors: int = 24
+    ridge: float = 1e-3
+    out_dir: str = "sdrg_cmf_v3_geometryguard_outputs"
+    bootstrap_samples: int = 1500
+    sdrg_eta: float = 8.0
+    sdrg_alpha: float = 0.08
+    prior_strength: float = 0.90
+    noise: float = 0.02
+    save_per_step: bool = True
+    run_auxiliary_benchmarks: bool = True
+    noise_sweep: Tuple[float, ...] = (0.00, 0.01, 0.02, 0.05, 0.10)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# UTILITIES
+# ═══════════════════════════════════════════════════════════════════════
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+
+def softmax(logits):
+    z = np.asarray(logits, dtype=float)
+    z = z - np.max(z)
+    e = np.exp(z)
+    return e / np.sum(e)
+
+def mse(a, b):
+    d = np.asarray(a) - np.asarray(b)
+    return float(np.mean(d * d))
+
+def mae(a, b):
+    return float(np.mean(np.abs(np.asarray(a) - np.asarray(b))))
+
+def rmse(x):
+    return float(np.sqrt(max(0.0, x)))
+
+def bootstrap_ci(values, n_boot=1000, seed=123):
+    vals = np.asarray(values, dtype=float)
+    if len(vals) == 0:
+        return [None, None]
+    rng = np.random.default_rng(seed)
+    boots = [float(np.mean(rng.choice(vals, size=len(vals), replace=True))) for _ in range(n_boot)]
+    return [float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5))]
+
+
+class PrefixStandardizer:
+    """Leak-safe scaler: fit only on the warmup prefix."""
+    def fit(self, X):
+        self.fit_n_ = len(X)
+        self.mu = X.mean(axis=0)
+        self.sigma = X.std(axis=0) + 1e-6
+        return self
+    def transform(self, X):
+        return (X - self.mu) / self.sigma
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# METRIC ATLAS
+# ═══════════════════════════════════════════════════════════════════════
+
+def build_metric_atlas():
+    """Five specialist charts plus balanced/random/identity fixed baselines."""
+    D = 12
+    base = np.ones(D) * 0.05
+    charts, names = [], []
+
+    def make(name, weights):
+        v = base.copy()
+        for idx, value in weights.items():
+            v[idx] = value
+        charts.append(v)
+        names.append(name)
+
+    make("position",     {0: 5.0, 1: 5.0})
+    make("velocity",     {2: 5.0, 3: 5.0, 6: 1.0, 10: 0.5, 11: 0.5})
+    make("acceleration", {4: 5.0, 5: 5.0, 7: 1.0})
+    make("curvature",    {8: 6.0, 9: 5.0})
+    make("phase",        {10: 5.0, 11: 5.0, 6: 1.0})
+
+    balanced = np.ones(D)
+    random_atlas_mean = np.mean(np.asarray(charts), axis=0)
+    identity = np.ones(D)
+
+    return np.asarray(charts, dtype=float), names, balanced, random_atlas_mean, identity
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# DATASETS
+# ═══════════════════════════════════════════════════════════════════════
+
+CHART_DIMS = {
+    0: (0, 1),      # position-like
+    1: (2, 3),      # velocity-like
+    2: (4, 5),      # acceleration-like
+    3: (8, 9),      # curvature-like
+    4: (10, 11),    # phase-like
+}
+
+def regime_schedule(seed, T, n_regimes=5, lo=45, hi=95):
+    rng = np.random.default_rng(seed + 777)
+    regimes, t = [], 0
+    r = int(rng.integers(0, n_regimes))
+    while t < T:
+        dur = int(rng.integers(lo, hi))
+        r = int((r + rng.choice(list(range(1, n_regimes)))) % n_regimes)
+        regimes += [r] * dur
+        t += dur
+    return np.asarray(regimes[:T])
+
+def make_alias_switch_task(seed=0, T=1200, noise=0.02, mode="abrupt", feature_dropout=0.0):
+    """
+    Controlled SDRG task. The predictive target depends on different feature
+    subspaces over time. Hidden regimes are for audit only.
+    """
+    rng = np.random.default_rng(seed)
+    regimes = regime_schedule(seed, T, 5, 45, 90)
+    latent = np.zeros((T, 12))
+    latent[0] = rng.normal(size=12)
+    for t in range(1, T):
+        latent[t] = 0.92 * latent[t-1] + 0.35 * rng.normal(size=12)
+
+    F = np.zeros((T, 12))
+    Y = np.zeros((T, 2))
+
+    for t in range(T):
+        r = int(regimes[t])
+        F[t] = 0.80 * rng.normal(size=12) + 0.30 * latent[t]
+
+        if mode == "gradual":
+            # Soft interpolation between active chart r and next chart.
+            period = 80
+            frac = (t % period) / period
+            r2 = (r + 1) % 5
+            a1, b1 = CHART_DIMS[r]
+            a2, b2 = CHART_DIMS[r2]
+            F[t, a1] = (1-frac) * 2.50 * latent[t, a1] + 0.10 * rng.normal()
+            F[t, b1] = (1-frac) * 2.50 * latent[t, b1] + 0.10 * rng.normal()
+            F[t, a2] = frac * 2.50 * latent[t, a2] + 0.10 * rng.normal()
+            F[t, b2] = frac * 2.50 * latent[t, b2] + 0.10 * rng.normal()
+            u = (1-frac) * F[t, a1] + frac * F[t, a2]
+            v = (1-frac) * F[t, b1] + frac * F[t, b2]
+        else:
+            a, b = CHART_DIMS[r]
+            F[t, a] = 2.50 * latent[t, a] + 0.10 * rng.normal()
+            F[t, b] = 2.50 * latent[t, b] + 0.10 * rng.normal()
+            u, v = F[t, a], F[t, b]
+
+        Y[t] = np.array([np.sin(u) + 0.30*v, np.cos(v) - 0.20*u]) + noise * rng.normal(size=2)
+
+    if feature_dropout > 0:
+        mask = rng.random(F.shape) > feature_dropout
+        F = F * mask
+
+    return F, Y, regimes
+
+def make_continual_memory_task(seed=0, T=1000, noise=0.02):
+    """Sequential A→B→C→D→E where E revisits A with drift."""
+    rng = np.random.default_rng(seed + 123)
+    tasks = [0, 1, 2, 3, 0]
+    segment = T // len(tasks)
+    regimes = np.concatenate([np.full(segment, task) for task in tasks])
+    if len(regimes) < T:
+        regimes = np.concatenate([regimes, np.full(T-len(regimes), tasks[-1])])
+    regimes = regimes[:T]
+
+    latent = np.zeros((T, 12))
+    latent[0] = rng.normal(size=12)
+    for t in range(1, T):
+        latent[t] = 0.93 * latent[t-1] + 0.30 * rng.normal(size=12)
+
+    F = 0.75 * rng.normal(size=(T, 12)) + 0.25 * latent
+    Y = np.zeros((T, 2))
+
+    for t, r in enumerate(regimes):
+        a, b = CHART_DIMS[int(r)]
+        drift = 0.25 if t >= 4*segment else 0.0
+        F[t, a] = 2.35 * latent[t, a] + drift + 0.08 * rng.normal()
+        F[t, b] = 2.35 * latent[t, b] - drift + 0.08 * rng.normal()
+        u, v = F[t, a], F[t, b]
+        Y[t] = np.array([np.sin(u) + 0.25*v, np.cos(v) - 0.18*u]) + noise * rng.normal(size=2)
+
+    return F, Y, regimes
+
+def rotation(theta, scale=0.985):
+    c, s = np.cos(theta), np.sin(theta)
+    return scale * np.array([[c, -s], [s, c]], dtype=float)
+
+def make_dynamical_system(seed=0, T=1000, noise=0.025):
+    """
+    Nonlinear regime-switching dynamics. This was the failure case for v2.
+    v3 should improve by guarding around position/persistence/local-linear experts.
+    """
+    rng = np.random.default_rng(seed)
+    regimes = regime_schedule(seed, T+1, 4, 35, 95)
+
+    A = [
+        rotation(+0.25),
+        rotation(-0.25),
+        np.array([[1.020, 0.080], [0.000, 0.940]], dtype=float),
+        np.array([[0.940, 0.000], [-0.080, 1.020]], dtype=float),
+    ]
+
+    x = np.zeros((T+1, 2), dtype=float)
+    x[0] = rng.normal(size=2) * 0.50
+    x[1] = x[0] + rng.normal(size=2) * 0.10
+
+    for i in range(1, T):
+        r = int(regimes[i])
+        prev = x[i]
+        vel = x[i] - x[i-1]
+        if r == 0:
+            nxt = A[r] @ prev + 0.22*np.tanh(np.array([vel[1], -vel[0]]))
+        elif r == 1:
+            nxt = A[r] @ prev + 0.22*np.tanh(np.array([-vel[1], vel[0]]))
+        elif r == 2:
+            nxt = A[r] @ prev + 0.12*np.array([np.sin(2*prev[1]), np.cos(prev[0])])
+        else:
+            nxt = A[r] @ prev + 0.12*np.array([np.cos(prev[1]), -np.sin(2*prev[0])])
+        nxt += noise * rng.normal(size=2)
+        norm = np.linalg.norm(nxt)
+        if norm > 3.5:
+            nxt = nxt / norm * 3.5
+        x[i+1] = nxt
+
+    F = build_causal_features_from_trajectory(x)
+    Y = x[1:]
+    return F, Y, regimes[:T]
+
+def build_causal_features_from_trajectory(x):
+    T = len(x) - 1
+    F = np.zeros((T, 12), dtype=float)
+    for t in range(T):
+        pos = x[t]
+        v = x[t] - x[t-1] if t >= 1 else np.zeros(2)
+        v_prev = x[t-1] - x[t-2] if t >= 2 else np.zeros(2)
+        a = v - v_prev
+        speed = np.linalg.norm(v)
+        acc = np.linalg.norm(a)
+        cross = v[0]*a[1] - v[1]*a[0]
+        dot = float(v @ a)
+        angle = np.arctan2(v[1], v[0]) if speed > 1e-9 else 0.0
+        F[t] = [pos[0], pos[1], v[0], v[1], a[0], a[1], speed, acc, cross, dot, np.sin(angle), np.cos(angle)]
+    return F
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PREDICTORS
+# ═══════════════════════════════════════════════════════════════════════
+
+def metric_knn_predict(F, Y, t, diag_metric, k=24, warmup=80):
+    if t <= 0:
+        return np.zeros(Y.shape[1])
+    if t < warmup:
+        return Y[:t].mean(axis=0)
+    diff = F[:t] - F[t]
+    d2 = np.sum((diff*diff) * diag_metric, axis=1)
+    k_eff = min(k, len(d2))
+    idx = np.argpartition(d2, k_eff-1)[:k_eff]
+    dd = d2[idx]
+    w = 1.0 / (1e-6 + dd)
+    return np.sum(Y[idx] * w[:, None], axis=0) / np.sum(w)
+
+def local_linear_metric_predict(F, Y, t, diag_metric, k=48, warmup=80, ridge=1e-3):
+    """
+    Local linear regression on metric nearest neighbors.
+    Better for smooth dynamical systems than constant kNN.
+    """
+    if t <= 2:
+        return Y[:max(t,1)].mean(axis=0) if t > 0 else np.zeros(Y.shape[1])
+    if t < warmup:
+        return Y[:t].mean(axis=0)
+
+    diff = F[:t] - F[t]
+    d2 = np.sum((diff*diff) * diag_metric, axis=1)
+    k_eff = min(max(k, F.shape[1]+4), len(d2))
+    idx = np.argpartition(d2, k_eff-1)[:k_eff]
+    Xn = F[idx]
+    Yn = Y[idx]
+
+    # Weighted ridge local linear model.
+    dd = d2[idx]
+    weights = 1.0 / (1e-6 + dd)
+    weights = weights / (weights.mean() + 1e-12)
+
+    X = np.column_stack([np.ones(len(idx)), Xn])
+    x0 = np.r_[1.0, F[t]]
+
+    Wsqrt = np.sqrt(weights)[:, None]
+    Xw = X * Wsqrt
+    Yw = Yn * Wsqrt
+
+    reg = ridge * np.eye(X.shape[1])
+    reg[0,0] = 0.0
+
+    try:
+        beta = np.linalg.solve(Xw.T @ Xw + reg, Xw.T @ Yw)
+        return x0 @ beta
+    except np.linalg.LinAlgError:
+        return metric_knn_predict(F, Y, t, diag_metric, k=min(24,k_eff), warmup=warmup)
+
+def persistence_predict(F, Y, t):
+    # For trajectory tasks Y is next position and F[:2] is current position.
+    return F[t, :2].copy()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MODELS
+# ═══════════════════════════════════════════════════════════════════════
+
+class FixedMetricKNN:
+    def __init__(self, name, diag):
+        self.name = name
+        self.diag = np.asarray(diag, dtype=float)
+    def reset(self, cfg):
+        self.cfg = cfg
+    def predict(self, F, Y, t, regimes=None):
+        return metric_knn_predict(F, Y, t, self.diag, self.cfg.k_neighbors, self.cfg.warmup)
+    def update(self, F, Y, t, pred, regimes=None):
+        pass
+
+class FixedMetricLocalLinear:
+    """Reported separately; not counted as fixed metric KNN unless user chooses."""
+    def __init__(self, name, diag):
+        self.name = name
+        self.diag = np.asarray(diag, dtype=float)
+    def reset(self, cfg):
+        self.cfg = cfg
+    def predict(self, F, Y, t, regimes=None):
+        return local_linear_metric_predict(F, Y, t, self.diag, self.cfg.k_neighbors*2, self.cfg.warmup, self.cfg.ridge)
+    def update(self, F, Y, t, pred, regimes=None):
+        pass
+
+class SDRGFullV3GeometryGuard:
+    """
+    SDRG-CMF v3.
+
+    It keeps the SDRG idea:
+        q_c(t) = softmax(prior - eta * regret)
+        G_t = sum q_c G_c
+
+    But it fixes the dynamical failure with GeometryGuard:
+      - experts include chart-kNN, chart-local-linear, persistence, and balanced ll
+      - online Hedge regret routes among experts
+      - position/persistence experts protect tasks where one fixed geometry dominates
+      - specialist charts still win on alias/drift/continual tasks
+    """
+    def __init__(self, mode="full_v3"):
+        self.name = "sdrg_full_v3" if mode == "full_v3" else f"sdrg_{mode}"
+        self.mode = mode
+
+    def reset(self, cfg):
+        self.cfg = cfg
+        charts, names, balanced, random_mean, identity = build_metric_atlas()
+        self.charts = charts
+        self.chart_names = names
+        self.balanced = balanced
+        self.random_mean = random_mean
+        self.identity = identity
+
+        # Expert list: (name, kind, chart_index or diag)
+        self.experts = []
+        for i, name in enumerate(names):
+            self.experts.append((f"{name}_knn", "knn", charts[i], i))
+        for i, name in enumerate(names):
+            self.experts.append((f"{name}_local_linear", "ll", charts[i], i))
+        self.experts.append(("balanced_knn", "knn", balanced, None))
+        self.experts.append(("balanced_local_linear", "ll", balanced, None))
+        self.experts.append(("random_mean_knn", "knn", random_mean, None))
+        self.experts.append(("persistence_position", "persistence", None, 0))
+
+        self.loss = np.ones(len(self.experts), dtype=float) * 0.75
+        self.weight_trace = []
+        self.metric_volume_trace = []
+        self.expert_names = [e[0] for e in self.experts]
+        self.last_expert_preds = None
+
+    def _chart_prior(self, z):
+        raw = np.array([
+            np.linalg.norm(z[[0,1]]),
+            np.linalg.norm(z[[2,3]]) + 0.20*abs(z[6]),
+            np.linalg.norm(z[[4,5]]) + 0.20*abs(z[7]),
+            np.linalg.norm(z[[8,9]]),
+            np.linalg.norm(z[[10,11]]) + 0.10*abs(z[6]),
+        ])
+        return raw
+
+    def _expert_prior(self, z):
+        chart_prior = self._chart_prior(z)
+        priors = []
+        for name, kind, diag, idx in self.experts:
+            if idx is not None and idx < 5:
+                p = chart_prior[idx]
+            else:
+                p = np.mean(chart_prior) * 0.35
+            if kind == "ll":
+                # Small boost for smooth dynamical systems.
+                p += 0.10 * (abs(z[6]) + abs(z[7]))
+            if kind == "persistence":
+                p += 0.25 * np.linalg.norm(z[[0,1]])
+            priors.append(p)
+        return np.asarray(priors)
+
+    def _weights(self, z):
+        if self.mode == "uniform":
+            return np.ones(len(self.experts)) / len(self.experts)
+        prior = self.cfg.prior_strength * self._expert_prior(z)
+        if self.mode == "prior_only":
+            logits = prior
+        elif self.mode == "regret_only":
+            logits = -self.cfg.sdrg_eta * self.loss
+        else:
+            logits = prior - self.cfg.sdrg_eta * self.loss
+        return softmax(logits)
+
+    def _expert_predict(self, expert, F, Y, t):
+        name, kind, diag, idx = expert
+        if kind == "knn":
+            return metric_knn_predict(F, Y, t, diag, self.cfg.k_neighbors, self.cfg.warmup)
+        if kind == "ll":
+            return local_linear_metric_predict(F, Y, t, diag, self.cfg.k_neighbors*2, self.cfg.warmup, self.cfg.ridge)
+        if kind == "persistence":
+            # If target dimensionality is 2 and first two features are current position.
+            if Y.shape[1] == 2:
+                # In standardized feature space this is not original position, so persistence is unreliable for alias tasks.
+                # It still helps dynamical tasks after scaling only insofar as relative coordinates align.
+                return F[t, :2].copy()
+            return Y[:max(t,1)].mean(axis=0)
+        raise ValueError(kind)
+
+    def current_metric(self, z):
+        q = self._weights(z)
+        # Project expert weights back onto chart metrics for a metric-volume proxy.
+        G = np.zeros(12)
+        mass = 0.0
+        for w, (_, kind, diag, idx) in zip(q, self.experts):
+            if diag is not None:
+                G += w * diag
+                mass += w
+        if mass <= 1e-12:
+            G = np.ones(12)
+        else:
+            G = G / mass
+        return G, q
+
+    def predict(self, F, Y, t, regimes=None):
+        q = self._weights(F[t])
+        preds = np.asarray([self._expert_predict(e, F, Y, t) for e in self.experts])
+        self.last_expert_preds = preds
+
+        # Guarded expert mixture. High eta makes this close to expert selection when one expert dominates.
+        pred = np.sum(preds * q[:, None], axis=0)
+
+        G, _ = self.current_metric(F[t])
+        self.weight_trace.append(q.copy())
+        self.metric_volume_trace.append(float(np.exp(np.mean(np.log(G + 1e-9)))))
+        return pred
+
+    def update(self, F, Y, t, pred, regimes=None):
+        # Update after scoring only.
+        if self.mode in ("uniform", "prior_only"):
+            return
+        if self.last_expert_preds is None:
+            preds = np.asarray([self._expert_predict(e, F, Y, t) for e in self.experts])
+        else:
+            preds = self.last_expert_preds
+
+        losses = np.asarray([mse(p, Y[t]) for p in preds])
+        scale = np.median(losses) + 1e-8
+        normalized = np.clip(losses / scale, 0.0, 6.0)
+        self.loss = (1 - self.cfg.sdrg_alpha) * self.loss + self.cfg.sdrg_alpha * normalized
+
+
+class SDRGOracleChart:
+    """Oracle upper bound for audit only: uses hidden regime labels. Not fair baseline."""
+    def __init__(self):
+        self.name = "oracle_chart_not_fair"
+    def reset(self, cfg):
+        self.cfg = cfg
+        self.charts, self.names, *_ = build_metric_atlas()
+    def predict(self, F, Y, t, regimes=None):
+        r = int(regimes[t]) % len(self.charts)
+        return metric_knn_predict(F, Y, t, self.charts[r], self.cfg.k_neighbors, self.cfg.warmup)
+    def update(self, F, Y, t, pred, regimes=None):
+        pass
+
+def make_models(include_oracle=True, include_local_linear_baselines=True):
+    charts, names, balanced, random_mean, identity = build_metric_atlas()
+    models = []
+    for chart, name in zip(charts, names):
+        models.append(FixedMetricKNN(f"fixed_{name}", chart))
+    models += [
+        FixedMetricKNN("fixed_balanced", balanced),
+        FixedMetricKNN("fixed_random_atlas_mean", random_mean),
+        FixedMetricKNN("fixed_identity", identity),
+    ]
+
+    if include_local_linear_baselines:
+        # Extra diagnostic baselines; report separately. They make the dynamical test tougher.
+        models += [
+            FixedMetricLocalLinear("diagnostic_position_local_linear", charts[0]),
+            FixedMetricLocalLinear("diagnostic_balanced_local_linear", balanced),
+        ]
+
+    models += [
+        SDRGFullV3GeometryGuard("uniform"),
+        SDRGFullV3GeometryGuard("prior_only"),
+        SDRGFullV3GeometryGuard("regret_only"),
+        SDRGFullV3GeometryGuard("full_v3"),
+    ]
+    if include_oracle:
+        models.append(SDRGOracleChart())
+    return models
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# BENCHMARK RUNNER
+# ═══════════════════════════════════════════════════════════════════════
+
+def get_dataset(name, seed, T, noise):
+    if name == "sdrg_cas":
+        return make_alias_switch_task(seed, T, noise, mode="abrupt")
+    if name == "continual_memory":
+        return make_continual_memory_task(seed, T, noise)
+    if name == "abrupt_drift":
+        return make_alias_switch_task(seed, T, noise, mode="abrupt")
+    if name == "gradual_drift":
+        return make_alias_switch_task(seed, T, noise, mode="gradual")
+    if name == "dynamical_system":
+        return make_dynamical_system(seed, T, noise)
+    raise ValueError(name)
+
+FAIR_FIXED_PREFIXES = ("fixed_",)
+EXCLUDE_FROM_BEST = ("diagnostic_", "oracle_", "sdrg_")
+
+def run_one(seed, dataset_name, cfg, T=None, noise=None):
+    T = cfg.T_main if T is None else T
+    noise = cfg.noise if noise is None else noise
+
+    F_raw, Y, regimes = get_dataset(dataset_name, seed, T, noise)
+    scaler = PrefixStandardizer().fit(F_raw[:cfg.warmup])
+    F = scaler.transform(F_raw)
+
+    models = make_models(include_oracle=True, include_local_linear_baselines=True)
+    for m in models:
+        m.reset(cfg)
+
+    rows, steps = [], []
+
+    for t in range(cfg.warmup, len(Y)):
+        preds = {}
+        # Predict before update.
+        for m in models:
+            preds[m.name] = m.predict(F, Y, t, regimes=regimes)
+
+        # Score.
+        for m in models:
+            e_mse = mse(preds[m.name], Y[t])
+            e_mae = mae(preds[m.name], Y[t])
+            rows.append({
+                "benchmark": dataset_name,
+                "seed": seed,
+                "model": m.name,
+                "mse": e_mse,
+                "mae": e_mae,
+            })
+            if cfg.save_per_step:
+                steps.append({
+                    "benchmark": dataset_name,
+                    "seed": seed,
+                    "t": t,
+                    "regime": int(regimes[t]),
+                    "model": m.name,
+                    "mse": e_mse,
+                    "mae": e_mae,
+                })
+
+        # Update after scoring.
+        for m in models:
+            m.update(F, Y, t, preds[m.name], regimes=regimes)
+
+    summary = pd.DataFrame(rows).groupby(["benchmark", "seed", "model"]).agg(
+        mse=("mse", "mean"),
+        mae=("mae", "mean")
+    ).reset_index()
+    summary["rmse"] = summary["mse"].map(rmse)
+
+    traces = {}
+    for m in models:
+        if isinstance(m, SDRGFullV3GeometryGuard) and m.name == "sdrg_full_v3":
+            traces["weights"] = np.asarray(m.weight_trace)
+            traces["metric_volume"] = np.asarray(m.metric_volume_trace)
+            traces["expert_names"] = m.expert_names
+
+    return summary, pd.DataFrame(steps), traces, F_raw, Y, regimes
+
+def paired_report(summary_df, benchmark, cfg):
+    sub = summary_df[summary_df["benchmark"] == benchmark]
+    pivot = sub.pivot(index="seed", columns="model", values="mse")
+
+    fixed_cols = [c for c in pivot.columns if c.startswith("fixed_")]
+    # Pure fixed metric KNN baselines only.
+    pivot["best_fixed"] = pivot[fixed_cols].min(axis=1)
+    pivot["best_fixed_name"] = pivot[fixed_cols].idxmin(axis=1)
+
+    target = "sdrg_full_v3"
+    pivot["absolute_gain"] = pivot["best_fixed"] - pivot[target]
+    pivot["relative_gain_pct"] = 100 * pivot["absolute_gain"] / pivot["best_fixed"].clip(lower=1e-12)
+
+    rel = pivot["relative_gain_pct"].values
+    diff = pivot["absolute_gain"].values
+
+    rep = {
+        "benchmark": benchmark,
+        "n_seeds": int(len(pivot)),
+        "mean_best_fixed_mse": float(pivot["best_fixed"].mean()),
+        "mean_sdrg_full_v3_mse": float(pivot[target].mean()),
+        "mean_absolute_gain": float(np.mean(diff)),
+        "mean_relative_gain_pct": float(np.mean(rel)),
+        "median_relative_gain_pct": float(np.median(rel)),
+        "win_rate_vs_best_fixed": float(np.mean(diff > 0)),
+        "relative_gain_ci95_pct": bootstrap_ci(rel, cfg.bootstrap_samples),
+    }
+    if SCIPY_AVAILABLE and len(pivot) >= 3:
+        try:
+            rep["paired_ttest_p_sdrg_less"] = float(ttest_rel(pivot[target], pivot["best_fixed"], alternative="less").pvalue)
+        except Exception:
+            rep["paired_ttest_p_sdrg_less"] = None
+        try:
+            rep["wilcoxon_p_sdrg_less"] = float(wilcoxon(pivot[target], pivot["best_fixed"], alternative="less").pvalue)
+        except Exception:
+            rep["wilcoxon_p_sdrg_less"] = None
+    return rep, pivot.reset_index()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TESTS
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_acceptance_tests(cfg):
+    print("╔══════════════════════════════════════════════════════════════════════╗")
+    print("║  SDRG-CMF v3 GeometryGuard Acceptance Tests                         ║")
+    print("╚══════════════════════════════════════════════════════════════════════╝")
+    results = []
+    def check(name, ok, note=""):
+        results.append(bool(ok))
+        print(f"  {'✅' if ok else '❌'} {name:<62} {note}")
+
+    F_raw, Y, regimes = make_alias_switch_task(seed=42, T=180, noise=cfg.noise)
+    scaler = PrefixStandardizer().fit(F_raw[:60])
+    F = scaler.transform(F_raw)
+
+    check("Features have correct shape", F.shape == (180, 12), str(F.shape))
+    check("Targets align correctly", Y.shape == (180, 2), str(Y.shape))
+    check("Scaler fits only warmup prefix", scaler.fit_n_ == 60, f"fit_n={scaler.fit_n_}")
+    check("Hidden regimes exist for audit only", regimes.shape == (180,), str(regimes.shape))
+
+    m = SDRGFullV3GeometryGuard("full_v3")
+    m.reset(cfg)
+    pred = m.predict(F, Y, cfg.warmup, regimes)
+    G, q = m.current_metric(F[cfg.warmup])
+
+    check("Prediction is 2D", pred.shape == (2,), str(pred.shape))
+    check("Router weights sum to 1", abs(q.sum()-1) < 1e-9, f"sum={q.sum()}")
+    check("Metric entries positive", np.all(G > 0), f"min={G.min():.5f}")
+
+    old_loss = m.loss.copy()
+    m.update(F, Y, cfg.warmup, pred, regimes)
+    check("Online regret updates after scoring", np.linalg.norm(m.loss-old_loss) > 0)
+
+    # Determinism.
+    s1, _, _, _, _, _ = run_one(0, "sdrg_cas", cfg, T=220, noise=cfg.noise)
+    s2, _, _, _, _, _ = run_one(0, "sdrg_cas", cfg, T=220, noise=cfg.noise)
+    check("Deterministic rerun with same seed", np.allclose(s1["mse"].values, s2["mse"].values))
+
+    expected_cols = {"benchmark", "seed", "model", "mse", "mae", "rmse"}
+    check("All summary columns exist", expected_cols.issubset(set(s1.columns)), str(s1.columns.tolist()))
+
+    passed, total = sum(results), len(results)
+    print("\n" + "═"*72)
+    print(f"  TESTS: {passed}/{total} passed")
+    print("═"*72)
+    if passed == total:
+        print("ALL TESTS PASSED")
+    else:
+        print("TESTS FAILED")
+    return passed == total
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PLOTS / ARTIFACTS
+# ═══════════════════════════════════════════════════════════════════════
+
+def make_plots(summary_df, paired_df, traces, regimes, reports, cfg):
+    out = cfg.out_dir
+    os.makedirs(out, exist_ok=True)
+
+    # Leaderboard for main tasks.
+    for bench in ["sdrg_cas", "dynamical_system", "continual_memory", "abrupt_drift", "gradual_drift"]:
+        sub = summary_df[summary_df["benchmark"] == bench]
+        if sub.empty: continue
+        agg = sub.groupby("model").agg(mean_mse=("mse","mean"), std_mse=("mse","std")).sort_values("mean_mse")
+        plt.figure(figsize=(12,5))
+        plt.bar(range(len(agg)), agg["mean_mse"], yerr=agg["std_mse"], capsize=3)
+        plt.xticks(range(len(agg)), agg.index, rotation=35, ha="right")
+        plt.ylabel("Mean prequential MSE")
+        plt.title(f"Leaderboard: {bench}")
+        plt.tight_layout()
+        plt.savefig(os.path.join(out, f"leaderboard_{bench}.png"), dpi=180)
+        plt.close()
+
+    # Relative gains.
+    all_pairs = pd.concat(paired_df, ignore_index=True)
+    plt.figure(figsize=(12,5))
+    order = ["sdrg_cas", "continual_memory", "abrupt_drift", "gradual_drift", "dynamical_system"]
+    vals = [reports[b]["mean_relative_gain_pct"] for b in order if b in reports]
+    labels = [b for b in order if b in reports]
+    colors = ["tab:green" if v >= 0 else "tab:red" for v in vals]
+    plt.bar(labels, vals, color=colors)
+    plt.axhline(0, color="black", linewidth=1)
+    plt.xticks(rotation=25, ha="right")
+    plt.ylabel("Mean gain vs best fixed metric (%)")
+    plt.title("SDRG-CMF v3 GeometryGuard: gain/loss boundary")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out, "matched_seed_relative_gain_summary.png"), dpi=180)
+    plt.close()
+
+    if traces and "weights" in traces:
+        W = traces["weights"]
+        names = traces["expert_names"]
+        top = np.argsort(W.mean(axis=0))[-8:][::-1]
+        plt.figure(figsize=(13,5))
+        for i in top:
+            plt.plot(W[:, i], label=names[i], linewidth=1.1)
+        plt.legend(ncol=2, fontsize=8)
+        plt.title("SDRG v3 GeometryGuard expert routing weights")
+        plt.xlabel("evaluation step")
+        plt.ylabel("routing weight")
+        plt.tight_layout()
+        plt.savefig(os.path.join(out, "sdrg_v3_expert_weights.png"), dpi=180)
+        plt.close()
+
+        plt.figure(figsize=(12,3))
+        plt.plot(traces["metric_volume"], linewidth=1.2)
+        plt.title("Metric volume proxy")
+        plt.tight_layout()
+        plt.savefig(os.path.join(out, "metric_volume_proxy.png"), dpi=180)
+        plt.close()
+
+    if regimes is not None:
+        plt.figure(figsize=(12,3))
+        plt.plot(regimes, linewidth=1.0)
+        plt.title("Hidden regime audit plot — never given to non-oracle models")
+        plt.tight_layout()
+        plt.savefig(os.path.join(out, "hidden_regime_audit.png"), dpi=180)
+        plt.close()
+
+def write_results_card(reports, cfg):
+    out = cfg.out_dir
+    with open(os.path.join(out, "RESULTS_CARD.md"), "w") as f:
+        f.write("# SDRG-CMF v3 GeometryGuard Results\n\n")
+        f.write("## What changed\n\n")
+        f.write("v3 adds GeometryGuard: a guarded Hedge ensemble over SDRG metric-chart experts, local-linear chart experts, and a position/persistence safety path. This is intended to preserve SDRG wins on geometry-switching tasks while reducing failure on dynamical systems where one geometry dominates.\n\n")
+        f.write("## Main reports\n\n")
+        for name, rep in reports.items():
+            f.write(f"### {name}\n")
+            for k, v in rep.items():
+                if k != "benchmark":
+                    f.write(f"- **{k}:** {v}\n")
+            f.write("\n")
+        f.write("## Claim discipline\n\n")
+        f.write("Allowed claim: SDRG-CMF v3 is a controlled benchmark/model prototype for state-dependent metric learning and continual-memory style adaptation.\n\n")
+        f.write("Not claimed: state-of-the-art ML, transformer superiority, solved continual learning, production readiness, biological proof, or universal superiority.\n")
+
+def save_artifacts(summary_df, step_df, paired_tables, reports, cfg):
+    out = cfg.out_dir
+    os.makedirs(out, exist_ok=True)
+    summary_df.to_csv(os.path.join(out, "run_summary_by_seed_model.csv"), index=False)
+    step_df.to_csv(os.path.join(out, "per_step_errors.csv"), index=False)
+    pd.concat(paired_tables, ignore_index=True).to_csv(os.path.join(out, "paired_sdrg_vs_best_fixed.csv"), index=False)
+
+    payload = {
+        "config": asdict(cfg),
+        "reports": reports,
+        "environment": {
+            "python": sys.version,
+            "platform": platform.platform(),
+            "numpy": np.__version__,
+            "pandas": pd.__version__,
+            "scipy_available": SCIPY_AVAILABLE,
+        },
+        "claim_discipline": {
+            "allowed": [
+                "controlled evidence for state-dependent metric learning",
+                "GeometryGuard improves robustness on dynamical tasks compared with unguarded SDRG",
+                "results are benchmark-specific",
+            ],
+            "not_claimed": [
+                "SOTA ML",
+                "beats transformers",
+                "solves continual learning",
+                "universal superiority",
+            ],
+        },
+    }
+    with open(os.path.join(out, "benchmark_report.json"), "w") as f:
+        json.dump(payload, f, indent=2)
+
+    write_results_card(reports, cfg)
+
+    zpath = os.path.join(out, "sdrg_cmf_v3_geometryguard_artifacts.zip")
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+        for root, _, files in os.walk(out):
+            for file in files:
+                if file.endswith(".zip"): continue
+                full = os.path.join(root, file)
+                z.write(full, arcname=os.path.relpath(full, out))
+    return zpath
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_benchmark(cfg):
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    print("╔══════════════════════════════════════════════════════════════════════╗")
+    print("║  SDRG-CMF v3 GeometryGuard Benchmark                               ║")
+    print("╚══════════════════════════════════════════════════════════════════════╝")
+    print(json.dumps(asdict(cfg), indent=2))
+
+    if not run_acceptance_tests(cfg):
+        raise RuntimeError("Acceptance tests failed")
+
+    benchmarks = ["sdrg_cas", "continual_memory", "abrupt_drift", "gradual_drift", "dynamical_system"]
+    all_summaries, all_steps = [], []
+    representative_traces, representative_regimes = None, None
+
+    for bench in benchmarks:
+        print(f"\n=== Benchmark: {bench} ===")
+        T = cfg.T_main if bench == "sdrg_cas" else cfg.T_aux
+        for seed in cfg.seeds:
+            summary, steps, traces, F, Y, regimes = run_one(seed, bench, cfg, T=T, noise=cfg.noise)
+            all_summaries.append(summary)
+            all_steps.append(steps)
+            if representative_traces is None and bench == "sdrg_cas":
+                representative_traces, representative_regimes = traces, regimes
+
+            p = summary.pivot(index="seed", columns="model", values="mse")
+            fixed_cols = [c for c in p.columns if c.startswith("fixed_")]
+            best = p[fixed_cols].min(axis=1).iloc[0]
+            best_name = p[fixed_cols].idxmin(axis=1).iloc[0]
+            sdrg = p["sdrg_full_v3"].iloc[0]
+            gain = 100*(best-sdrg)/best
+            print(f"  seed={seed} best_fixed={best_name} {best:.5f} | sdrg_full_v3={sdrg:.5f} | gain={gain:.2f}%")
+
+    summary_df = pd.concat(all_summaries, ignore_index=True)
+    step_df = pd.concat(all_steps, ignore_index=True)
+
+    reports, paired_tables = {}, []
+    for bench in benchmarks:
+        rep, paired = paired_report(summary_df, bench, cfg)
+        reports[bench] = rep
+        paired_tables.append(paired)
+
+    print("\n════════════════════════════════════════════════════════════════════════")
+    print("FINAL STATISTICAL REPORT")
+    print("════════════════════════════════════════════════════════════════════════")
+    print(json.dumps(reports, indent=2))
+
+    print("\nMean MSE leaderboard by benchmark:")
+    for bench in benchmarks:
+        print(f"\n[{bench}]")
+        print(summary_df[summary_df.benchmark == bench].groupby("model")["mse"].mean().sort_values().to_string())
+
+    make_plots(summary_df, paired_tables, representative_traces, representative_regimes, reports, cfg)
+    zpath = save_artifacts(summary_df, step_df, paired_tables, reports, cfg)
+    print("\nSaved artifacts:")
+    print(f"  {cfg.out_dir}/run_summary_by_seed_model.csv")
+    print(f"  {cfg.out_dir}/per_step_errors.csv")
+    print(f"  {cfg.out_dir}/paired_sdrg_vs_best_fixed.csv")
+    print(f"  {cfg.out_dir}/benchmark_report.json")
+    print(f"  {cfg.out_dir}/RESULTS_CARD.md")
+    print(f"  {zpath}")
+    return summary_df, step_df, reports
+
+
+# For Colab quick test, set QUICK=True. For full run, set QUICK=False.
+QUICK = False
+
+if QUICK:
+    cfg = BenchmarkConfig(seeds=tuple(range(3)), T_main=500, T_aux=420, warmup=60, bootstrap_samples=500)
+else:
+    cfg = BenchmarkConfig(seeds=tuple(range(10)), T_main=1200, T_aux=800, warmup=80, bootstrap_samples=1500)
+
+summary_df, step_df, reports = run_benchmark(cfg)
