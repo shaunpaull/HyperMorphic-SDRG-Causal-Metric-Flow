@@ -435,7 +435,7 @@ Suggested Citation
 
 @misc{sdrg_causal_metric_flow,
   title  = {SDRG Causal Metric Flow: Continual Memory Through State-Dependent Representation Geometry},
-  author = {Gerrard, Shaun Paul},
+  author = { Shaun Paul},
   year   = {2026},
   note   = {Research prototype}
 }
