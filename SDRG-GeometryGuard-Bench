@@ -1,0 +1,1096 @@
+#!/usr/bin/env python3
+"""
+SDRG-CMF v5 GeometryGuard Real-World Benchmark with Time-Series Experts
+
+Real-world time-series benchmark comparing:
+  - SDRG GeometryGuard online metric-memory model
+  - fixed metric baselines
+  - RNN / GRU / LSTM / Transformer baselines in PyTorch
+
+Datasets are loaded from statsmodels built-in real-world datasets where possible:
+  - Mauna Loa CO2
+  - Sunspots
+  - Nile river flow
+  - US macrodata
+
+Protocol:
+  - chronological train/validation/test split
+  - scalers fit only on training prefix
+  - no future leakage
+  - GeometryGuard uses prequential test evaluation:
+      predict y_t using train + prior test targets only, then update
+  - neural models train on train, tune by validation, evaluate test
+  - optional neural online fine-tuning is disabled by default
+
+This is a research benchmark, not a claim of SOTA.
+"""
+
+import os, json, time, math, random, platform, sys, zipfile, warnings
+from dataclasses import dataclass, asdict
+from typing import List, Tuple, Dict, Optional
+from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+try:
+    import statsmodels.api as sm
+    STATSMODELS_AVAILABLE = True
+except Exception:
+    STATSMODELS_AVAILABLE = False
+
+try:
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import TensorDataset, DataLoader
+    TORCH_AVAILABLE = True
+except Exception:
+    TORCH_AVAILABLE = False
+
+try:
+    from scipy.stats import ttest_rel, wilcoxon
+    SCIPY_AVAILABLE = True
+except Exception:
+    SCIPY_AVAILABLE = False
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class RWBenchmarkConfig:
+    out_dir: str = "sdrg_geometryguard_realworld_v3_timeseries_outputs"
+    seed: int = 42
+    seq_len: int = 24
+    train_frac: float = 0.60
+    val_frac: float = 0.20
+    k_neighbors: int = 24
+    ridge: float = 1e-3
+    sdrg_eta: float = 6.0
+    sdrg_alpha: float = 0.08
+    prior_strength: float = 0.70
+    torch_epochs: int = 20
+    torch_batch_size: int = 32
+    torch_lr: float = 1e-3
+    torch_hidden: int = 48
+    torch_layers: int = 1
+    transformer_heads: int = 4
+    transformer_layers: int = 1
+    include_transformer: bool = True
+    include_rnn: bool = True
+    enable_neural_online_finetune: bool = False
+    quick: bool = True
+    max_datasets_quick: int = 2
+    max_points_quick: int = 420
+    max_test_points_quick: int = 100
+    use_local_linear_experts: bool = False
+    season_period: int = 52
+    mean_reversion_window: int = 52
+    warm_start_on_validation: bool = True
+    prior_guard_strength: float = 2.5
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# REPRO / METRICS
+# ═══════════════════════════════════════════════════════════════════════
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    if TORCH_AVAILABLE:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+def mse(yhat, y):
+    yhat, y = np.asarray(yhat), np.asarray(y)
+    return float(np.mean((yhat - y) ** 2))
+
+def mae(yhat, y):
+    yhat, y = np.asarray(yhat), np.asarray(y)
+    return float(np.mean(np.abs(yhat - y)))
+
+def rmse(v):
+    return float(np.sqrt(max(0.0, v)))
+
+def softmax(x):
+    z = np.asarray(x, dtype=float)
+    z -= z.max()
+    e = np.exp(z)
+    return e / e.sum()
+
+def bootstrap_ci(vals, n=1000, seed=123):
+    vals = np.asarray(vals, dtype=float)
+    if len(vals) == 0:
+        return [None, None]
+    rng = np.random.default_rng(seed)
+    out = [float(np.mean(rng.choice(vals, size=len(vals), replace=True))) for _ in range(n)]
+    return [float(np.percentile(out, 2.5)), float(np.percentile(out, 97.5))]
+
+
+class TrainScaler:
+    """Leak-safe scaler fit only on training split."""
+    def fit(self, X):
+        self.fit_n_ = len(X)
+        self.mu = np.nanmean(X, axis=0)
+        self.sigma = np.nanstd(X, axis=0) + 1e-8
+        return self
+    def transform(self, X):
+        return (X - self.mu) / self.sigma
+    def inverse_y(self, y_scaled, y_index=0):
+        return y_scaled * self.sigma[y_index] + self.mu[y_index]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# REAL-WORLD DATASETS
+# ═══════════════════════════════════════════════════════════════════════
+
+def clean_series(x):
+    x = pd.Series(np.asarray(x, dtype=float)).replace([np.inf, -np.inf], np.nan)
+    x = x.interpolate(limit_direction="both").ffill().bfill()
+    return x.values.astype(float)
+
+def load_realworld_series() -> Dict[str, np.ndarray]:
+    """
+    Load real-world univariate or selected target series.
+    Uses statsmodels built-in datasets to avoid fragile external downloads.
+    """
+    datasets = {}
+
+    if STATSMODELS_AVAILABLE:
+        try:
+            co2 = sm.datasets.co2.load_pandas().data["co2"]
+            co2 = co2.interpolate(limit_direction="both").ffill().bfill()
+            datasets["mauna_loa_co2"] = clean_series(co2.values)
+        except Exception as e:
+            print("Could not load CO2:", e)
+
+        try:
+            sun = sm.datasets.sunspots.load_pandas().data["SUNACTIVITY"]
+            datasets["sunspots"] = clean_series(sun.values)
+        except Exception as e:
+            print("Could not load sunspots:", e)
+
+        try:
+            nile = sm.datasets.nile.load_pandas().data["volume"]
+            datasets["nile"] = clean_series(nile.values)
+        except Exception as e:
+            print("Could not load nile:", e)
+
+        try:
+            macro = sm.datasets.macrodata.load_pandas().data
+            # Real GDP quarterly series.
+            datasets["us_realgdp"] = clean_series(macro["realgdp"].values)
+            datasets["us_inflation"] = clean_series(macro["infl"].values)
+        except Exception as e:
+            print("Could not load macrodata:", e)
+
+    if not datasets:
+        # Last-resort real data from a tiny embedded sunspot-like public-domain snippet would be inappropriate.
+        # Instead fail loudly.
+        raise RuntimeError("No real-world datasets available. Install statsmodels or add a CSV loader.")
+
+    return datasets
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CAUSAL FEATURE ENGINEERING
+# ═══════════════════════════════════════════════════════════════════════
+
+def rolling_stat(arr, window, fn, default=0.0):
+    if len(arr) == 0:
+        return default
+    v = arr[-window:] if len(arr) >= window else arr
+    return float(fn(v))
+
+def make_causal_features_from_series(series: np.ndarray, seq_len: int):
+    """
+    For each t, build causal features from y[:t+1], target y[t+1].
+    Feature vector has:
+      recent lags, deltas, rolling means/stds, curvature, momentum, phase.
+    Neural baselines use raw lag windows separately.
+    """
+    y = clean_series(series)
+    n = len(y)
+    rows, targets, windows = [], [], []
+
+    for t in range(seq_len, n - 1):
+        hist = y[:t+1]
+        win = y[t-seq_len+1:t+1]
+        prev = y[t]
+        d1 = y[t] - y[t-1]
+        d2 = (y[t] - y[t-1]) - (y[t-1] - y[t-2]) if t >= 2 else 0.0
+
+        feat = []
+        # normalized later; raw scale okay here
+        feat.extend(win.tolist())                               # seq_len recent values
+        feat.extend(np.diff(win, prepend=win[0]).tolist())       # seq_len local deltas
+        feat.append(d1)
+        feat.append(d2)
+        feat.append(rolling_stat(hist, 3, np.mean))
+        feat.append(rolling_stat(hist, 6, np.mean))
+        feat.append(rolling_stat(hist, 12, np.mean))
+        feat.append(rolling_stat(hist, 24, np.mean))
+        feat.append(rolling_stat(hist, 6, np.std))
+        feat.append(rolling_stat(hist, 12, np.std))
+        feat.append(rolling_stat(hist, 24, np.std))
+        feat.append(prev - rolling_stat(hist, 12, np.mean))
+        feat.append(prev - rolling_stat(hist, 24, np.mean))
+        # phase proxies over yearly/monthly-ish windows
+        angle = 2 * math.pi * (t % max(2, seq_len)) / max(2, seq_len)
+        feat.append(math.sin(angle))
+        feat.append(math.cos(angle))
+
+        rows.append(feat)
+        targets.append(y[t+1])
+        windows.append(win.copy())
+
+    F = np.asarray(rows, dtype=float)
+    Y = np.asarray(targets, dtype=float).reshape(-1, 1)
+    W = np.asarray(windows, dtype=float).reshape(len(windows), seq_len, 1)
+    return F, Y, W
+
+def split_indices(n, train_frac=0.6, val_frac=0.2):
+    n_train = int(n * train_frac)
+    n_val = int(n * val_frac)
+    train = np.arange(0, n_train)
+    val = np.arange(n_train, n_train+n_val)
+    test = np.arange(n_train+n_val, n)
+    return train, val, test
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# GEOMETRYGUARD REAL-WORLD MODEL
+# ═══════════════════════════════════════════════════════════════════════
+
+def build_rw_metric_atlas(D, seq_len):
+    """
+    Metric charts over causal engineered feature vector.
+    Coordinates:
+      0:seq_len             lags
+      seq_len:2*seq_len     deltas
+      tail                  summary stats
+    """
+    base = np.ones(D) * 0.05
+    charts, names = [], []
+
+    def make(name, idxs, high=4.0, mid=None):
+        v = base.copy()
+        for i in idxs:
+            if 0 <= i < D:
+                v[i] = high
+        if mid:
+            for i in mid:
+                if 0 <= i < D:
+                    v[i] = max(v[i], 1.0)
+        charts.append(v)
+        names.append(name)
+
+    lags = list(range(seq_len))
+    deltas = list(range(seq_len, 2*seq_len))
+    tail0 = 2*seq_len
+    recent_lags = list(range(max(0, seq_len-6), seq_len))
+    recent_deltas = list(range(seq_len+max(0, seq_len-6), 2*seq_len))
+
+    make("level_recent", recent_lags, high=5.0, mid=[tail0+0, tail0+1, tail0+2])
+    make("trend_delta", recent_deltas + [tail0, tail0+1], high=5.0, mid=[tail0+2, tail0+3])
+    make("seasonal_phase", [tail0+10, tail0+11], high=5.0, mid=lags[::max(1,seq_len//6)])
+    make("volatility", [tail0+4, tail0+5, tail0+6], high=5.0, mid=recent_deltas)
+    make("mean_reversion", [tail0+7, tail0+8, tail0+2, tail0+3], high=5.0, mid=recent_lags)
+    balanced = np.ones(D)
+    random_mean = np.mean(np.asarray(charts), axis=0)
+    identity = np.ones(D)
+    return np.asarray(charts), names, balanced, random_mean, identity
+
+def metric_knn_predict(F_hist, Y_hist, x, diag, k=24):
+    if len(F_hist) == 0:
+        return np.zeros(Y_hist.shape[1] if len(Y_hist.shape) > 1 else 1)
+    diff = F_hist - x
+    d2 = np.sum((diff * diff) * diag, axis=1)
+    k_eff = min(k, len(d2))
+    idx = np.argpartition(d2, k_eff - 1)[:k_eff]
+    dd = d2[idx]
+    w = 1.0 / (1e-6 + dd)
+    return np.sum(Y_hist[idx] * w[:, None], axis=0) / np.sum(w)
+
+def local_linear_predict(F_hist, Y_hist, x, diag, k=48, ridge=1e-3):
+    if len(F_hist) < 4:
+        return metric_knn_predict(F_hist, Y_hist, x, diag, k=min(k, max(1, len(F_hist))))
+    diff = F_hist - x
+    d2 = np.sum((diff * diff) * diag, axis=1)
+    k_eff = min(max(k, F_hist.shape[1]//2 + 4), len(d2))
+    idx = np.argpartition(d2, k_eff - 1)[:k_eff]
+    Xn, Yn = F_hist[idx], Y_hist[idx]
+    dd = d2[idx]
+    weights = 1.0 / (1e-6 + dd)
+    weights = weights / (weights.mean() + 1e-12)
+    X = np.column_stack([np.ones(len(idx)), Xn])
+    x0 = np.r_[1.0, x]
+    Wsqrt = np.sqrt(weights)[:, None]
+    Xw = X * Wsqrt
+    Yw = Yn * Wsqrt
+    reg = ridge * np.eye(X.shape[1])
+    reg[0,0] = 0.0
+    try:
+        beta = np.linalg.solve(Xw.T @ Xw + reg, Xw.T @ Yw)
+        return x0 @ beta
+    except Exception:
+        return metric_knn_predict(F_hist, Y_hist, x, diag, k=min(24, len(F_hist)))
+
+class GeometryGuardRW:
+    def __init__(self, cfg, D, seq_len, mode="full"):
+        self.cfg, self.D, self.seq_len, self.mode = cfg, D, seq_len, mode
+        charts, names, balanced, random_mean, identity = build_rw_metric_atlas(D, seq_len)
+        self.charts, self.chart_names = charts, names
+        self.experts = []
+        for i, name in enumerate(names):
+            self.experts.append((f"{name}_knn", "knn", charts[i], i))
+        if getattr(self.cfg, "use_local_linear_experts", False):
+            for i, name in enumerate(names):
+                self.experts.append((f"{name}_local_linear", "ll", charts[i], i))
+            self.experts.append(("balanced_local_linear", "ll", balanced, None))
+        self.experts.append(("balanced_knn", "knn", balanced, None))
+        self.experts.append(("random_mean_knn", "knn", random_mean, None))
+        self.experts.append(("identity_knn", "knn", identity, None))
+
+        # Real-world forecasting guards. These are causal experts, not labels.
+        # They target common real series structure: persistence, mean reversion,
+        # seasonality, and damped trend. They let GeometryGuard compete when
+        # the world is trend/seasonality dominated rather than geometry-switch dominated.
+        self.experts.append(("persistence_y", "persistence", None, None))
+        self.experts.append(("rolling_mean_reversion", "mean_reversion", None, None))
+        self.experts.append(("seasonal_naive", "seasonal", None, None))
+        self.experts.append(("seasonal_drift", "seasonal_drift", None, None))
+        self.experts.append(("damped_trend", "damped_trend", None, None))
+        self.loss = np.ones(len(self.experts)) * 0.75
+        self.weight_trace = []
+        self.expert_names = [e[0] for e in self.experts]
+        self.last_preds = None
+
+    def prior(self, x):
+        s = self.seq_len
+        tail = 2*s
+        # Only observable magnitudes from current causal feature.
+        return np.array([
+            np.linalg.norm(x[max(0,s-6):s]),                 # level
+            np.linalg.norm(x[s+max(0,s-6):2*s]) + abs(x[tail]), # trend
+            abs(x[tail+10]) + abs(x[tail+11]),                # phase
+            abs(x[tail+4]) + abs(x[tail+5]) + abs(x[tail+6]), # volatility
+            abs(x[tail+7]) + abs(x[tail+8]),                 # mean reversion
+        ])
+
+    def weights(self, x):
+        if self.mode == "uniform":
+            return np.ones(len(self.experts)) / len(self.experts)
+        p5 = self.prior(x)
+        priors = []
+        for name, kind, diag, idx in self.experts:
+            if idx is not None:
+                p = p5[idx]
+            else:
+                p = 0.35 * np.mean(p5)
+            if kind == "ll":
+                p += 0.10 * (abs(x[2*self.seq_len]) + abs(x[2*self.seq_len+1]))
+            elif kind in ("mean_reversion", "seasonal", "seasonal_drift"):
+                tail = 2*self.seq_len
+                # Mean-reversion features live in tail+7/tail+8; phase in tail+10/tail+11.
+                p += 0.20 * (abs(x[tail+7]) + abs(x[tail+8])) + 0.10 * (abs(x[tail+10]) + abs(x[tail+11]))
+            elif kind in ("persistence", "damped_trend"):
+                p += 0.15 * abs(x[2*self.seq_len])
+            priors.append(p)
+        priors = np.asarray(priors)
+        if self.mode == "prior_only":
+            logits = self.cfg.prior_strength * priors
+        elif self.mode == "regret_only":
+            logits = -self.cfg.sdrg_eta * self.loss
+        else:
+            # GeometryGuard v2: use the causal prior as a tie-breaker, not a dictator.
+            # When online regret has clearly identified a strong real-world expert
+            # (e.g. mean reversion on CO2), the prior is automatically damped.
+            loss_gap = float(np.median(self.loss) - np.min(self.loss))
+            prior_gate = math.exp(-self.cfg.prior_guard_strength * max(0.0, loss_gap))
+            logits = (self.cfg.prior_strength * prior_gate) * priors - self.cfg.sdrg_eta * self.loss
+        return softmax(logits)
+
+    def expert_predict(self, expert, F_hist, Y_hist, x):
+        name, kind, diag, idx = expert
+        if kind == "knn":
+            return metric_knn_predict(F_hist, Y_hist, x, diag, self.cfg.k_neighbors)
+        if kind == "ll":
+            return local_linear_predict(F_hist, Y_hist, x, diag, max(2*self.cfg.k_neighbors, 32), self.cfg.ridge)
+        if kind == "persistence":
+            return Y_hist[-1].copy()
+        if kind == "mean_reversion":
+            y = Y_hist[:, 0]
+            w = min(len(y), max(4, self.cfg.mean_reversion_window))
+            mu = float(np.mean(y[-w:]))
+            last = float(y[-1])
+            if len(y) >= 4:
+                trend = float(np.median(np.diff(y[-min(8, len(y)):])) )
+            else:
+                trend = 0.0
+            return np.array([last + 0.35*(mu - last) + 0.25*trend])
+        if kind == "seasonal":
+            y = Y_hist[:, 0]
+            p = int(self.cfg.season_period)
+            if len(y) > p:
+                return np.array([float(y[-p])])
+            return Y_hist[-1].copy()
+        if kind == "seasonal_drift":
+            y = Y_hist[:, 0]
+            p = int(self.cfg.season_period)
+            if len(y) > p + 4:
+                seasonal = float(y[-p])
+                drift = float(np.mean(y[-min(p,len(y)):]) - np.mean(y[-min(2*p,len(y)):-min(p,len(y))])) if len(y) >= 2*p else 0.0
+                return np.array([seasonal + 0.5*drift])
+            return Y_hist[-1].copy()
+        if kind == "damped_trend":
+            y = Y_hist[:, 0]
+            last = float(y[-1])
+            if len(y) >= 6:
+                trend = float(np.median(np.diff(y[-6:])))
+            elif len(y) >= 2:
+                trend = float(y[-1] - y[-2])
+            else:
+                trend = 0.0
+            return np.array([last + 0.7*trend])
+        raise ValueError(kind)
+
+    def predict(self, F_hist, Y_hist, x):
+        q = self.weights(x)
+        preds = np.asarray([self.expert_predict(e, F_hist, Y_hist, x) for e in self.experts])
+        self.last_preds = preds
+        self.weight_trace.append(q.copy())
+        return np.sum(preds * q[:, None], axis=0)
+
+    def update(self, y_true):
+        if self.mode in ("uniform", "prior_only"):
+            return
+        losses = np.asarray([mse(p, y_true) for p in self.last_preds])
+        scale = np.median(losses) + 1e-8
+        normalized = np.clip(losses / scale, 0.0, 6.0)
+        self.loss = (1 - self.cfg.sdrg_alpha) * self.loss + self.cfg.sdrg_alpha * normalized
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# NEURAL BASELINES
+# ═══════════════════════════════════════════════════════════════════════
+
+if TORCH_AVAILABLE:
+    class SeqRegressor(nn.Module):
+        def __init__(self, kind, input_dim=1, hidden=48, layers=1, heads=4, transformer_layers=1):
+            super().__init__()
+            self.kind = kind
+            self.hidden = hidden
+            if kind == "RNN":
+                self.seq = nn.RNN(input_dim, hidden, layers, batch_first=True)
+                self.head = nn.Linear(hidden, 1)
+            elif kind == "GRU":
+                self.seq = nn.GRU(input_dim, hidden, layers, batch_first=True)
+                self.head = nn.Linear(hidden, 1)
+            elif kind == "LSTM":
+                self.seq = nn.LSTM(input_dim, hidden, layers, batch_first=True)
+                self.head = nn.Linear(hidden, 1)
+            elif kind == "Transformer":
+                self.proj = nn.Linear(input_dim, hidden)
+                enc_layer = nn.TransformerEncoderLayer(
+                    d_model=hidden, nhead=heads, dim_feedforward=hidden*2,
+                    batch_first=True, dropout=0.05
+                )
+                self.encoder = nn.TransformerEncoder(enc_layer, num_layers=transformer_layers)
+                self.pos = nn.Parameter(torch.randn(1, 512, hidden) * 0.01)
+                self.head = nn.Linear(hidden, 1)
+            else:
+                raise ValueError(kind)
+
+        def forward(self, x):
+            if self.kind in ("RNN", "GRU", "LSTM"):
+                out, _ = self.seq(x)
+                return self.head(out[:, -1, :])
+            h = self.proj(x)
+            h = h + self.pos[:, :h.shape[1], :]
+            out = self.encoder(h)
+            return self.head(out[:, -1, :])
+
+def train_torch_model(kind, Xtr, ytr, Xval, yval, Xte, cfg):
+    if not TORCH_AVAILABLE:
+        return None
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    set_seed(cfg.seed + hash(kind) % 10000)
+
+    model = SeqRegressor(
+        kind,
+        input_dim=Xtr.shape[-1],
+        hidden=cfg.torch_hidden,
+        layers=cfg.torch_layers,
+        heads=cfg.transformer_heads,
+        transformer_layers=cfg.transformer_layers,
+    ).to(device)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.torch_lr, weight_decay=1e-4)
+    loss_fn = nn.MSELoss()
+
+    Xtr_t = torch.tensor(Xtr, dtype=torch.float32)
+    ytr_t = torch.tensor(ytr, dtype=torch.float32)
+    Xval_t = torch.tensor(Xval, dtype=torch.float32).to(device)
+    yval_t = torch.tensor(yval, dtype=torch.float32).to(device)
+    Xte_t = torch.tensor(Xte, dtype=torch.float32).to(device)
+
+    loader = DataLoader(TensorDataset(Xtr_t, ytr_t), batch_size=cfg.torch_batch_size, shuffle=True)
+
+    best_state, best_val = None, float("inf")
+    patience, bad = 5, 0
+
+    for ep in range(cfg.torch_epochs):
+        model.train()
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            opt.zero_grad()
+            loss = loss_fn(model(xb), yb)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_loss = float(loss_fn(model(Xval_t), yval_t).item())
+        if val_loss < best_val:
+            best_val = val_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+            if bad >= patience:
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad():
+        preds = model(Xte_t).cpu().numpy()
+    return preds
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# EVALUATION
+# ═══════════════════════════════════════════════════════════════════════
+
+def evaluate_geometryguard(F, Y, train_idx, val_idx, test_idx, cfg, seq_len):
+    scaler = TrainScaler().fit(F[train_idx])
+    Fs = scaler.transform(F)
+
+    F_hist = Fs[np.r_[train_idx, val_idx]]
+    Y_hist = Y[np.r_[train_idx, val_idx]]
+    preds_by_model = {}
+
+    # Fixed metric baselines over full training+val prefix, no online update beyond appending true test points.
+    charts, names, balanced, random_mean, identity = build_rw_metric_atlas(Fs.shape[1], seq_len)
+    fixed = [(f"fixed_{n}", c) for n, c in zip(names, charts)] + [
+        ("fixed_balanced", balanced),
+        ("fixed_random_atlas_mean", random_mean),
+        ("fixed_identity", identity),
+    ]
+
+    for name, diag in fixed:
+        histF, histY = F_hist.copy(), Y_hist.copy()
+        preds = []
+        for idx in test_idx:
+            pred = metric_knn_predict(histF, histY, Fs[idx], diag, cfg.k_neighbors)
+            preds.append(pred)
+            histF = np.vstack([histF, Fs[idx:idx+1]])
+            histY = np.vstack([histY, Y[idx:idx+1]])
+        preds_by_model[name] = np.asarray(preds)
+
+    # SDRG modes. Warm-start regret on validation prequentially, just as
+    # neural models use validation for early stopping/model selection.
+    for mode, outname in [("uniform","sdrg_uniform"), ("prior_only","sdrg_prior_only"),
+                          ("regret_only","sdrg_regret_only"), ("full","sdrg_geometryguard_full")]:
+        model = GeometryGuardRW(cfg, Fs.shape[1], seq_len, mode=mode)
+
+        if cfg.warm_start_on_validation and mode in ("regret_only", "full"):
+            warmF, warmY = Fs[train_idx].copy(), Y[train_idx].copy()
+            for vidx in val_idx:
+                pred_v = model.predict(warmF, warmY, Fs[vidx])
+                model.update(Y[vidx])
+                warmF = np.vstack([warmF, Fs[vidx:vidx+1]])
+                warmY = np.vstack([warmY, Y[vidx:vidx+1]])
+
+        histF, histY = F_hist.copy(), Y_hist.copy()
+        preds = []
+        for idx in test_idx:
+            pred = model.predict(histF, histY, Fs[idx])
+            preds.append(pred)
+            model.update(Y[idx])
+            histF = np.vstack([histF, Fs[idx:idx+1]])
+            histY = np.vstack([histY, Y[idx:idx+1]])
+        preds_by_model[outname] = np.asarray(preds)
+
+    return preds_by_model, Y[test_idx]
+
+def evaluate_neural(W, Y, train_idx, val_idx, test_idx, cfg):
+    if not TORCH_AVAILABLE:
+        return {}
+
+    # Scale windows/targets based on train prefix.
+    flat_train = W[train_idx].reshape(-1, W.shape[-1])
+    x_mu = flat_train.mean(axis=0)
+    x_sigma = flat_train.std(axis=0) + 1e-8
+    y_mu = Y[train_idx].mean(axis=0)
+    y_sigma = Y[train_idx].std(axis=0) + 1e-8
+
+    Ws = (W - x_mu) / x_sigma
+    Ys = (Y - y_mu) / y_sigma
+
+    Xtr, ytr = Ws[train_idx], Ys[train_idx]
+    Xval, yval = Ws[val_idx], Ys[val_idx]
+    Xte = Ws[test_idx]
+
+    kinds = []
+    if cfg.include_rnn:
+        kinds += ["RNN", "GRU", "LSTM"]
+    if cfg.include_transformer:
+        kinds += ["Transformer"]
+
+    preds = {}
+    for kind in kinds:
+        try:
+            ps = train_torch_model(kind, Xtr, ytr, Xval, yval, Xte, cfg)
+            if ps is not None:
+                preds[kind.lower()] = ps * y_sigma + y_mu
+        except Exception as e:
+            print(f"  neural baseline {kind} failed: {e}")
+    return preds
+
+
+def run_dataset(name, series, cfg):
+    if cfg.quick and cfg.max_points_quick is not None and len(series) > cfg.max_points_quick:
+        # Use most recent segment for speed while preserving chronological order.
+        series = series[-cfg.max_points_quick:]
+    F, Y, W = make_causal_features_from_series(series, cfg.seq_len)
+    n = len(Y)
+    train_idx, val_idx, test_idx = split_indices(n, cfg.train_frac, cfg.val_frac)
+    if cfg.quick and cfg.max_test_points_quick is not None and len(test_idx) > cfg.max_test_points_quick:
+        test_idx = test_idx[:cfg.max_test_points_quick]
+
+    geom_preds, y_test = evaluate_geometryguard(F, Y, train_idx, val_idx, test_idx, cfg, cfg.seq_len)
+    neural_preds = evaluate_neural(W, Y, train_idx, val_idx, test_idx, cfg)
+
+    rows = []
+    for model, pred in {**geom_preds, **neural_preds}.items():
+        rows.append({
+            "dataset": name,
+            "model": model,
+            "mse": mse(pred, y_test),
+            "rmse": rmse(mse(pred, y_test)),
+            "mae": mae(pred, y_test),
+            "n_test": int(len(y_test)),
+        })
+    return pd.DataFrame(rows)
+
+
+def paired_summary(results_df):
+    datasets = sorted(results_df["dataset"].unique())
+    rows = []
+
+    for ds in datasets:
+        sub = results_df[results_df.dataset == ds]
+        sdrg = float(sub[sub.model == "sdrg_geometryguard_full"]["mse"].iloc[0])
+        # Strong baseline set includes fixed metrics and neural sequence models.
+        fair = sub[~sub.model.isin(["sdrg_geometryguard_full", "sdrg_uniform", "sdrg_prior_only", "sdrg_regret_only"])]
+        best_row = fair.sort_values("mse").iloc[0]
+        gain = 100.0 * (float(best_row.mse) - sdrg) / max(float(best_row.mse), 1e-12)
+        rows.append({
+            "dataset": ds,
+            "best_non_sdrg_model": best_row.model,
+            "best_non_sdrg_mse": float(best_row.mse),
+            "sdrg_mse": sdrg,
+            "relative_gain_pct": gain,
+            "sdrg_win": bool(gain > 0),
+        })
+    return pd.DataFrame(rows)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PLOTS / ARTIFACTS
+# ═══════════════════════════════════════════════════════════════════════
+
+def make_plots(results, paired, cfg):
+    out = cfg.out_dir
+    os.makedirs(out, exist_ok=True)
+
+    # Per dataset leaderboard.
+    for ds in sorted(results.dataset.unique()):
+        sub = results[results.dataset == ds].sort_values("mse")
+        plt.figure(figsize=(11,5))
+        plt.bar(range(len(sub)), sub["mse"].values)
+        plt.xticks(range(len(sub)), sub["model"].values, rotation=35, ha="right")
+        plt.ylabel("Test MSE")
+        plt.title(f"Real-world leaderboard: {ds}")
+        plt.tight_layout()
+        plt.savefig(os.path.join(out, f"leaderboard_{ds}.png"), dpi=180)
+        plt.close()
+
+    plt.figure(figsize=(10,4))
+    colors = ["tab:green" if x else "tab:red" for x in paired["sdrg_win"]]
+    plt.bar(paired["dataset"], paired["relative_gain_pct"], color=colors)
+    plt.axhline(0, color="black", linewidth=1)
+    plt.xticks(rotation=30, ha="right")
+    plt.ylabel("SDRG gain vs best non-SDRG baseline (%)")
+    plt.title("GeometryGuard vs best fixed/neural baseline")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out, "sdrg_vs_best_non_sdrg_gain.png"), dpi=180)
+    plt.close()
+
+def write_results_card(results, paired, cfg):
+    out = cfg.out_dir
+    with open(os.path.join(out, "RESULTS_CARD.md"), "w") as f:
+        f.write("# SDRG GeometryGuard Real-World Benchmark\n\n")
+        f.write("Compared SDRG GeometryGuard against fixed metric baselines and PyTorch RNN/GRU/LSTM/Transformer baselines on statsmodels real-world time series.\n\n")
+        f.write("## Paired summary\n\n")
+        f.write(paired.to_markdown(index=False))
+        f.write("\n\n## Claim discipline\n\n")
+        f.write("- Allowed: controlled real-world time-series comparison under chronological train/val/test splits.\n")
+        f.write("- Not claimed: SOTA forecasting, transformer superiority, production readiness, or universal SDRG superiority.\n")
+        f.write("\n\n## Notes\n\n")
+        f.write("GeometryGuard is evaluated as an online prequential memory model on the test segment, updating only after each true test target is observed. Neural baselines are trained on train and selected by validation unless online fine-tuning is explicitly enabled.\n")
+
+def save_artifacts(results, paired, cfg):
+    out = cfg.out_dir
+    os.makedirs(out, exist_ok=True)
+    results.to_csv(os.path.join(out, "realworld_model_results.csv"), index=False)
+    paired.to_csv(os.path.join(out, "paired_sdrg_vs_best_non_sdrg.csv"), index=False)
+
+    report = {
+        "config": asdict(cfg),
+        "environment": {
+            "python": sys.version,
+            "platform": platform.platform(),
+            "numpy": np.__version__,
+            "pandas": pd.__version__,
+            "torch_available": TORCH_AVAILABLE,
+            "statsmodels_available": STATSMODELS_AVAILABLE,
+            "scipy_available": SCIPY_AVAILABLE,
+        },
+        "paired_summary": paired.to_dict(orient="records"),
+        "claim_discipline": {
+            "allowed": [
+                "real-world chronological benchmark against fixed metric and neural sequence baselines",
+                "GeometryGuard evaluated as online prequential metric-memory model",
+            ],
+            "not_claimed": [
+                "SOTA forecasting",
+                "beats all transformers",
+                "production readiness",
+                "universal superiority",
+            ],
+        },
+    }
+    with open(os.path.join(out, "benchmark_report.json"), "w") as f:
+        json.dump(report, f, indent=2)
+
+    write_results_card(results, paired, cfg)
+
+    zpath = os.path.join(out, "sdrg_geometryguard_realworld_artifacts.zip")
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+        for root, _, files in os.walk(out):
+            for file in files:
+                if file.endswith(".zip"):
+                    continue
+                full = os.path.join(root, file)
+                z.write(full, arcname=os.path.relpath(full, out))
+    return zpath
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TESTS
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_tests(cfg):
+    print("╔══════════════════════════════════════════════════════════════════════╗")
+    print("║  GeometryGuard Real-World Benchmark Acceptance Tests                ║")
+    print("╚══════════════════════════════════════════════════════════════════════╝")
+    checks = []
+    def check(name, ok, note=""):
+        checks.append(bool(ok))
+        print(f"  {'✅' if ok else '❌'} {name:<62} {note}")
+
+    datasets = load_realworld_series()
+    check("At least one real-world dataset loads", len(datasets) > 0, list(datasets.keys()))
+
+    name, series = next(iter(datasets.items()))
+    F, Y, W = make_causal_features_from_series(series, cfg.seq_len)
+    check("Causal feature matrix is 2D", F.ndim == 2, str(F.shape))
+    check("Targets align as column vector", Y.ndim == 2 and Y.shape[1] == 1, str(Y.shape))
+    check("Neural windows align", W.shape[0] == Y.shape[0], str(W.shape))
+
+    tr, va, te = split_indices(len(Y), cfg.train_frac, cfg.val_frac)
+    scaler = TrainScaler().fit(F[tr])
+    check("Scaler fits only training prefix", scaler.fit_n_ == len(tr), f"fit_n={scaler.fit_n_}")
+
+    model = GeometryGuardRW(cfg, F.shape[1], cfg.seq_len, mode="full")
+    Fs = scaler.transform(F)
+    pred = model.predict(Fs[tr], Y[tr], Fs[va[0]])
+    check("GeometryGuard prediction shape", pred.shape == (1,), str(pred.shape))
+    old = model.loss.copy()
+    model.update(Y[va[0]])
+    check("GeometryGuard regret updates", np.linalg.norm(model.loss - old) > 0)
+
+    passed = sum(checks)
+    print("\n" + "═"*72)
+    print(f"  TESTS: {passed}/{len(checks)} passed")
+    print("═"*72)
+    if passed == len(checks):
+        print("ALL TESTS PASSED")
+    return passed == len(checks)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_benchmark(cfg):
+    set_seed(cfg.seed)
+    os.makedirs(cfg.out_dir, exist_ok=True)
+
+    print("╔══════════════════════════════════════════════════════════════════════╗")
+    print("║  SDRG GeometryGuard Real-World Benchmark                           ║")
+    print("╚══════════════════════════════════════════════════════════════════════╝")
+    print(json.dumps(asdict(cfg), indent=2))
+
+    if not run_tests(cfg):
+        raise RuntimeError("Acceptance tests failed.")
+
+    datasets = load_realworld_series()
+    if cfg.quick:
+        datasets = dict(list(datasets.items())[:cfg.max_datasets_quick])
+
+    all_results = []
+    for name, series in datasets.items():
+        print(f"\n=== Dataset: {name} | n={len(series)} ===")
+        df = run_dataset(name, series, cfg)
+        print(df.sort_values("mse").to_string(index=False))
+        all_results.append(df)
+
+    results = pd.concat(all_results, ignore_index=True)
+    paired = paired_summary(results)
+
+    print("\n════════════════════════════════════════════════════════════════════════")
+    print("PAIRED SUMMARY: SDRG vs BEST NON-SDRG BASELINE")
+    print("════════════════════════════════════════════════════════════════════════")
+    print(paired.to_string(index=False))
+
+    make_plots(results, paired, cfg)
+    zpath = save_artifacts(results, paired, cfg)
+
+    print("\nSaved artifacts:")
+    print(f"  {cfg.out_dir}/realworld_model_results.csv")
+    print(f"  {cfg.out_dir}/paired_sdrg_vs_best_non_sdrg.csv")
+    print(f"  {cfg.out_dir}/benchmark_report.json")
+    print(f"  {cfg.out_dir}/RESULTS_CARD.md")
+    print(f"  {zpath}")
+
+    return results, paired
+
+
+# Colab controls.
+QUICK = True
+
+if QUICK:
+    cfg = RWBenchmarkConfig(
+        quick=True,
+        seq_len=12,
+        k_neighbors=12,
+        torch_epochs=3,
+        torch_hidden=24,
+        torch_batch_size=64,
+        max_datasets_quick=2,
+        max_points_quick=420,
+        max_test_points_quick=100,
+        use_local_linear_experts=False,
+        include_transformer=True,
+        include_rnn=True,
+    )
+else:
+    cfg = RWBenchmarkConfig(
+        quick=False,
+        seq_len=24,
+        torch_epochs=30,
+        torch_hidden=64,
+        max_datasets_quick=99,
+        include_transformer=True,
+        include_rnn=True,
+    )
+
+
+
+
+
+╔══════════════════════════════════════════════════════════════════════╗
+║  SDRG GeometryGuard Real-World Benchmark                           ║
+╚══════════════════════════════════════════════════════════════════════╝
+{
+  "out_dir": "sdrg_geometryguard_realworld_v3_timeseries_outputs",
+  "seed": 42,
+  "seq_len": 24,
+  "train_frac": 0.6,
+  "val_frac": 0.2,
+  "k_neighbors": 24,
+  "ridge": 0.001,
+  "sdrg_eta": 6.0,
+  "sdrg_alpha": 0.08,
+  "prior_strength": 0.7,
+  "torch_epochs": 30,
+  "torch_batch_size": 32,
+  "torch_lr": 0.001,
+  "torch_hidden": 64,
+  "torch_layers": 1,
+  "transformer_heads": 4,
+  "transformer_layers": 1,
+  "include_transformer": true,
+  "include_rnn": true,
+  "enable_neural_online_finetune": false,
+  "quick": false,
+  "max_datasets_quick": 99,
+  "max_points_quick": 420,
+  "max_test_points_quick": 100,
+  "use_local_linear_experts": false,
+  "season_period": 52,
+  "mean_reversion_window": 52,
+  "warm_start_on_validation": true,
+  "prior_guard_strength": 2.5
+}
+╔══════════════════════════════════════════════════════════════════════╗
+║  GeometryGuard Real-World Benchmark Acceptance Tests                ║
+╚══════════════════════════════════════════════════════════════════════╝
+  ✅ At least one real-world dataset loads                          ['mauna_loa_co2', 'sunspots', 'nile', 'us_realgdp', 'us_inflation']
+  ✅ Causal feature matrix is 2D                                    (2259, 61)
+  ✅ Targets align as column vector                                 (2259, 1)
+  ✅ Neural windows align                                           (2259, 24, 1)
+  ✅ Scaler fits only training prefix                               fit_n=1355
+  ✅ GeometryGuard prediction shape                                 (1,)
+  ✅ GeometryGuard regret updates                                   
+
+════════════════════════════════════════════════════════════════════════
+  TESTS: 7/7 passed
+════════════════════════════════════════════════════════════════════════
+ALL TESTS PASSED
+
+=== Dataset: mauna_loa_co2 | n=2284 ===
+      dataset                   model        mse      rmse       mae  n_test
+mauna_loa_co2        sdrg_regret_only   0.258758  0.508683  0.386536     453
+mauna_loa_co2 sdrg_geometryguard_full   0.268710  0.518373  0.394198     453
+mauna_loa_co2      fixed_level_recent   1.444098  1.201706  0.980175     453
+mauna_loa_co2         sdrg_prior_only   3.162003  1.778202  1.483062     453
+mauna_loa_co2    fixed_mean_reversion   3.561998  1.887326  1.709838     453
+mauna_loa_co2            sdrg_uniform   3.999790  1.999948  1.897755     453
+mauna_loa_co2    fixed_seasonal_phase   6.042984  2.458248  2.227848     453
+mauna_loa_co2        fixed_volatility   7.475763  2.734184  2.408475     453
+mauna_loa_co2 fixed_random_atlas_mean   7.711457  2.776951  2.596595     453
+mauna_loa_co2          fixed_balanced   7.945914  2.818850  2.676892     453
+mauna_loa_co2          fixed_identity   7.945914  2.818850  2.676892     453
+mauna_loa_co2                     rnn  28.720584  5.359159  4.864041     453
+mauna_loa_co2                     gru  32.577261  5.707649  5.211707     453
+mauna_loa_co2                    lstm  49.875311  7.062245  6.246533     453
+mauna_loa_co2       fixed_trend_delta  51.011849  7.142258  6.821367     453
+mauna_loa_co2             transformer 133.655788 11.560960 10.859884     453
+
+=== Dataset: sunspots | n=309 ===
+ dataset                   model         mse      rmse       mae  n_test
+sunspots                     rnn  446.173537 21.122820 15.043955      58
+sunspots                     gru  464.352950 21.548850 15.446588      58
+sunspots                    lstm  502.145416 22.408601 15.503838      58
+sunspots             transformer  632.859498 25.156699 18.099511      58
+sunspots         sdrg_prior_only  772.713381 27.797723 19.132602      58
+sunspots      fixed_level_recent  784.846312 28.015109 18.779027      58
+sunspots fixed_random_atlas_mean  807.808753 28.421977 18.999994      58
+sunspots sdrg_geometryguard_full  815.734138 28.561060 19.627295      58
+sunspots            sdrg_uniform  829.545520 28.801832 19.621318      58
+sunspots       fixed_trend_delta  829.926914 28.808452 20.435599      58
+sunspots        sdrg_regret_only  844.037853 29.052330 19.917381      58
+sunspots        fixed_volatility  889.406318 29.822916 20.937802      58
+sunspots          fixed_balanced  937.969209 30.626283 21.024729      58
+sunspots          fixed_identity  937.969209 30.626283 21.024729      58
+sunspots    fixed_mean_reversion 1091.927216 33.044322 22.385523      58
+sunspots    fixed_seasonal_phase 1160.054986 34.059580 23.613299      58
+
+=== Dataset: nile | n=100 ===
+dataset                   model          mse       rmse        mae  n_test
+   nile                     gru 15375.632983 123.998520 102.983946      15
+   nile        fixed_volatility 15687.209946 125.248593 105.382478      15
+   nile    fixed_mean_reversion 15731.969353 125.427148 103.422399      15
+   nile fixed_random_atlas_mean 16114.836231 126.944225 107.761236      15
+   nile sdrg_geometryguard_full 16250.586415 127.477788 107.218396      15
+   nile        sdrg_regret_only 16390.826658 128.026664 107.615141      15
+   nile    fixed_seasonal_phase 16397.514289 128.052779 105.885641      15
+   nile                     rnn 16424.963618 128.159914 108.103049      15
+   nile                    lstm 16599.366403 128.838528 109.017046      15
+   nile       fixed_trend_delta 16691.875135 129.197040 112.082101      15
+   nile          fixed_balanced 16964.338978 130.247223 108.026407      15
+   nile          fixed_identity 16964.338978 130.247223 108.026407      15
+   nile      fixed_level_recent 17091.329175 130.733810 111.681087      15
+   nile         sdrg_prior_only 17352.664902 131.729514 110.917505      15
+   nile            sdrg_uniform 17861.435143 133.646680 112.722712      15
+   nile             transformer 18033.169711 134.287638 117.092037      15
+
+=== Dataset: us_realgdp | n=203 ===
+   dataset                   model          mse        rmse         mae  n_test
+us_realgdp        sdrg_regret_only 1.108614e+04  105.290745   91.724628      37
+us_realgdp sdrg_geometryguard_full 1.269428e+04  112.668910   99.858623      37
+us_realgdp    fixed_mean_reversion 2.484016e+05  498.399042  468.891710      37
+us_realgdp      fixed_level_recent 2.778379e+05  527.103356  491.963641      37
+us_realgdp         sdrg_prior_only 4.835372e+05  695.368373  656.116411      37
+us_realgdp    fixed_seasonal_phase 5.423201e+05  736.423836  717.277418      37
+us_realgdp          fixed_identity 6.774019e+05  823.044266  796.981345      37
+us_realgdp          fixed_balanced 6.774019e+05  823.044266  796.981345      37
+us_realgdp fixed_random_atlas_mean 7.108584e+05  843.124203  818.636500      37
+us_realgdp        fixed_volatility 1.010320e+06 1005.146854  915.422003      37
+us_realgdp            sdrg_uniform 1.286199e+06 1134.107169 1127.661883      37
+us_realgdp       fixed_trend_delta 6.520579e+06 2553.542417 2473.878415      37
+us_realgdp                     rnn 7.399477e+06 2720.197894 2657.595916      37
+us_realgdp                     gru 9.956837e+06 3155.445627 3086.092044      37
+us_realgdp             transformer 1.124389e+07 3353.191486 3283.022328      37
+us_realgdp                    lstm 1.536243e+07 3919.493391 3854.847185      37
+
+=== Dataset: us_inflation | n=203 ===
+     dataset                   model       mse     rmse      mae  n_test
+us_inflation            sdrg_uniform  9.508180 3.083534 1.965526      37
+us_inflation          fixed_identity  9.539309 3.088577 1.908673      37
+us_inflation          fixed_balanced  9.539309 3.088577 1.908673      37
+us_inflation      fixed_level_recent  9.658193 3.107763 1.927451      37
+us_inflation        sdrg_regret_only  9.885585 3.144135 1.931555      37
+us_inflation fixed_random_atlas_mean  9.885856 3.144178 1.929438      37
+us_inflation sdrg_geometryguard_full  9.894349 3.145528 1.923272      37
+us_inflation                     rnn 10.050191 3.170204 2.018262      37
+us_inflation        fixed_volatility 10.117611 3.180819 1.930424      37
+us_inflation    fixed_seasonal_phase 10.326308 3.213457 2.036847      37
+us_inflation                     gru 10.430531 3.229633 2.030723      37
+us_inflation         sdrg_prior_only 10.471652 3.235993 1.975625      37
+us_inflation    fixed_mean_reversion 10.493836 3.239419 1.978923      37
+us_inflation       fixed_trend_delta 10.747685 3.278366 2.104610      37
+us_inflation                    lstm 10.932390 3.306416 2.085562      37
+us_inflation             transformer 11.134149 3.336787 2.154973      37
+
+════════════════════════════════════════════════════════════════════════
+PAIRED SUMMARY: SDRG vs BEST NON-SDRG BASELINE
+════════════════════════════════════════════════════════════════════════
+      dataset  best_non_sdrg_model  best_non_sdrg_mse     sdrg_mse  relative_gain_pct  sdrg_win
+mauna_loa_co2   fixed_level_recent           1.444098     0.268710          81.392501      True
+         nile                  gru       15375.632983 16250.586415          -5.690520     False
+     sunspots                  rnn         446.173537   815.734138         -82.828893     False
+ us_inflation       fixed_identity           9.539309     9.894349          -3.721862     False
+   us_realgdp fixed_mean_reversion      248401.605099 12694.283307          94.889613      True
+
+Saved artifacts:
+  sdrg_geometryguard_realworld_v3_timeseries_outputs/realworld_model_results.csv
+  sdrg_geometryguard_realworld_v3_timeseries_outputs/paired_sdrg_vs_best_non_sdrg.csv
+  sdrg_geometryguard_realworld_v3_timeseries_outputs/benchmark_report.json
+  sdrg_geometryguard_realworld_v3_timeseries_outputs/RESULTS_CARD.md
+  sdrg_geometryguard_realworld_v3_timeseries_outputs/sdrg_geometryguard_realworld_artifacts.zip
+
+results, paired = run_benchmark(cfg)
